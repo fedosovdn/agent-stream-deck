@@ -24,3 +24,13 @@ See `CONTRIBUTING.md` for the pull-request contract and `SECURITY.md` for the co
 Use public `#area` entry points between source areas; follow the import direction in `docs/ARCHITECTURE.md`. Native boundary checks require ordinary ESM imports, including `import type`, rather than inline import types or `require`.
 
 Keep task sources independent of one another. Keep the shared queue independent of I/O and the Stream Deck SDK, and keep the launcher independent of that SDK. Follow `docs/ARCHITECTURE.md` for module responsibilities and integration boundaries.
+
+<!-- x9-performance:start -->
+## Performance
+
+Performance notes for this repository live in `docs/maintenance/performance/`.
+
+- Before changing code for speed, memory, load, or cost, read `docs/maintenance/performance/README.md` and the recent entries of `docs/maintenance/performance/journal.md`; do not retry an approach the journal records as rejected without new evidence.
+- Keep any wait, retry, or limit that the notes or a code comment mark as a guard, unless the condition it protects is handled another way.
+- Claim a performance gain only with before-and-after numbers measured as `docs/maintenance/performance/README.md` describes, and record the attempt in the journal, including reverted ones.
+<!-- x9-performance:end -->
