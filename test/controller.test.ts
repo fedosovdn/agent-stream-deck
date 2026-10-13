@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import fsPromises, { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import streamDeck from "@elgato/streamdeck";
+import streamDeck, { type KeyAction, type TitleParametersDidChangeEvent } from "@elgato/streamdeck";
 import type { HostHealth, HostSnapshot, TaskSource } from "#agents";
 import { CodexMicroRendererBridge, type CodexSource } from "#codex";
 import { type OpenCodeCollector, type OpenCodeCollectorSnapshot, OpenCodeSource, type OpenCodeTask } from "#opencode";
@@ -161,13 +162,15 @@ async function poll(context: TestContext, deck: Deck): Promise<void> {
 
 type FakeKey = {
   images: string[];
+  titles: string[];
   alerts: () => number;
-  action: never;
+  action: KeyAction<Record<string, never>>;
   event: never;
 };
 
 function fakeKey(id: string, options: { onAlert?: () => void } = {}): FakeKey {
   const images: string[] = [];
+  const titles: string[] = [];
   let alerts = 0;
   const action = {
     id,
@@ -175,14 +178,22 @@ function fakeKey(id: string, options: { onAlert?: () => void } = {}): FakeKey {
     setImage: async (image: string) => {
       images.push(decodeURIComponent(image));
     },
-    setTitle: async () => {},
+    setTitle: async (title: string) => {
+      titles.push(title);
+    },
     showAlert: async () => {
       alerts++;
       options.onAlert?.();
     },
     showOk: async () => assert.fail("no Agent or reset key acknowledges with showOk"),
   };
-  return { images, alerts: () => alerts, action: action as never, event: { action } as never };
+  return {
+    images,
+    titles,
+    alerts: () => alerts,
+    action: action as unknown as KeyAction<Record<string, never>>,
+    event: { action } as never,
+  };
 }
 
 function registerAgents(controller: DeckController, count: number): FakeKey[] {
@@ -1071,3 +1082,232 @@ test("overlapping refresh triggers share one source poll, and an Agent press-dow
   await poll(context, deck);
   assert.equal(deck.codex.refreshes, 3, "the next scheduled poll runs once the shared one has settled");
 });
+
+test("animated Agent frames clear each registration title once", async (context) => {
+  const deck = createDeck();
+  const input = createMicroSnapshot();
+  for (const slot of input.slots) {
+    slot.status = "working";
+    slot.selected = false;
+  }
+  deck.codex.localSnapshot = { host, snapshot: input, observedAt: Date.now() };
+  deck.codex.localHealth = { state: "ready", changedAt: 1 };
+  await startDeck(context, deck, { mockTimers: true });
+  const keys = registerAgents(deck.controller, 6);
+  await drain();
+  const initialImages = keys.map((key) => key.images.length);
+  for (let frame = 0; frame < 120; frame++) {
+    context.mock.timers.tick(200);
+    await drain();
+  }
+  assert.deepEqual(
+    keys.map((key) => key.images.length - initialImages[keys.indexOf(key)]!),
+    [120, 120, 120, 120, 120, 120],
+  );
+  assert.deepEqual(
+    keys.map((key) => key.titles),
+    [[""], [""], [""], [""], [""], [""]],
+  );
+});
+
+function titleEvents(context: TestContext) {
+  const listeners = new Set<(event: TitleParametersDidChangeEvent) => void>();
+  context.mock.method(
+    streamDeck.actions,
+    "onTitleParametersDidChange",
+    (listener: (event: TitleParametersDidChangeEvent) => void) => {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
+    },
+  );
+  return {
+    size: () => listeners.size,
+    dispatch: (key: FakeKey, title: string) => {
+      for (const listener of listeners) listener({ action: key.action, payload: { title } } as never);
+    },
+  };
+}
+
+function defer() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("concurrent public renders share a title clear and retry a failed clear with unchanged image", async (context) => {
+  const events = titleEvents(context);
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("shared-title");
+  deck.controller.registerAgent(0, key.action);
+  await drain();
+  const gate = defer();
+  context.mock.method(key.action, "setTitle", async (title: string) => {
+    key.titles.push(title);
+    await gate.promise;
+  });
+  events.dispatch(key, "External");
+  const first = deck.controller.toggleTargetHost();
+  const second = deck.controller.toggleTargetHost();
+  await drain();
+  assert.deepEqual(key.titles, ["", ""]);
+  assert.equal(key.images.length, 1);
+  gate.resolve();
+  await Promise.all([first, second]);
+
+  let failed = false;
+  context.mock.method(key.action, "setTitle", async (title: string) => {
+    key.titles.push(title);
+    if (!failed) {
+      failed = true;
+      throw new Error("title send failed");
+    }
+  });
+  events.dispatch(key, "External again");
+  await assert.rejects(deck.controller.toggleTargetHost(), /title send failed/);
+  await deck.controller.toggleTargetHost();
+  assert.deepEqual(key.titles, ["", "", "", ""]);
+  assert.equal(key.images.length, 1, "retrying the title does not resend a successful image");
+});
+
+test("a rejected image retries without repeating a successful title clear", async (context) => {
+  const events = titleEvents(context);
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("image-retry");
+  deck.controller.registerHostToggle(key.action);
+  await drain();
+  deck.codex.localHealth = { state: "ready", changedAt: 2 };
+  let failed = false;
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    if (!failed) {
+      failed = true;
+      throw new Error("image send failed");
+    }
+    key.images.push(decodeURIComponent(image));
+  });
+  events.dispatch(key, "External");
+  await assert.rejects(deck.controller.toggleTargetHost(), /image send failed/);
+  await drain();
+  await deck.controller.toggleTargetHost();
+  assert.deepEqual(key.titles, ["", ""]);
+  assert.equal(key.images.length, 2);
+});
+
+test("disappearance and same-id registration isolate late title completion for Agent and host keys", async (context) => {
+  const events = titleEvents(context);
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  for (const kind of ["agent", "host"] as const) {
+    const old = fakeKey(kind);
+    const oldGate = defer();
+    context.mock.method(old.action, "setTitle", async (title: string) => {
+      old.titles.push(title);
+      await oldGate.promise;
+    });
+    if (kind === "agent") deck.controller.registerAgent(0, old.action);
+    else deck.controller.registerHostToggle(old.action);
+    await drain();
+    if (kind === "agent") deck.controller.unregisterAgent({ id: kind });
+    else deck.controller.unregisterHostToggle({ id: kind });
+    const next = fakeKey(kind);
+    if (kind === "agent") deck.controller.registerAgent(0, next.action);
+    else deck.controller.registerHostToggle(next.action);
+    await drain();
+    assert.deepEqual(next.titles, [""], "the new context sends its own clear");
+    events.dispatch(next, "External after registration");
+    oldGate.resolve();
+    await drain();
+    await deck.controller.toggleTargetHost();
+    assert.deepEqual(next.titles, ["", ""], "the old success cannot suppress a new context clear");
+    if (kind === "agent") deck.controller.registerAgent(0, next.action);
+    else deck.controller.registerHostToggle(next.action);
+    await drain();
+    assert.deepEqual(next.titles, ["", "", ""], "even the same action object starts a fresh registration");
+    if (kind === "agent") deck.controller.unregisterAgent({ id: kind });
+    else deck.controller.unregisterHostToggle({ id: kind });
+  }
+});
+
+test("nonempty title events survive an in-flight clear, ignore empty echoes, and dispose across restart", async (context) => {
+  const events = titleEvents(context);
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("external-title");
+  deck.controller.registerAgent(0, key.action);
+  await drain();
+  const gate = defer();
+  context.mock.method(key.action, "setTitle", async (title: string) => {
+    key.titles.push(title);
+    events.dispatch(key, "");
+    await gate.promise;
+  });
+  events.dispatch(key, "External");
+  const clear = deck.controller.toggleTargetHost();
+  events.dispatch(key, "Changed during send");
+  gate.resolve();
+  await clear;
+  await deck.controller.toggleTargetHost();
+  await deck.controller.toggleTargetHost();
+  assert.deepEqual(key.titles, ["", "", ""]);
+  assert.equal(key.images.length, 1);
+  assert.equal(events.size(), 1);
+  deck.controller.stop();
+  assert.equal(events.size(), 0);
+  events.dispatch(key, "Stopped");
+  await deck.controller.start();
+  assert.equal(events.size(), 1);
+  assert.deepEqual(key.titles, ["", "", "", ""], "restart establishes a fresh title clear");
+  deck.controller.stop();
+  assert.equal(events.size(), 0);
+});
+
+for (const outcome of ["disappearance", "replacement", "stop"] as const) {
+  test(`a delayed fixed-key image cannot restore the title context after ${outcome}`, async (context) => {
+    const deck = createDeck();
+    await startDeck(context, deck, { mockTimers: true });
+    const gate = defer();
+    const reachedRead = defer();
+    const originalRead = fsPromises.readFile;
+    const read = context.mock.method(fsPromises, "readFile", (async (
+      ...args: Parameters<typeof fsPromises.readFile>
+    ) => {
+      if (basename(String(args[0])) !== "delayed-title-keycap.svg") return originalRead(...args);
+      reachedRead.resolve();
+      await gate.promise;
+      return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 144 144"><rect width="144" height="144" fill="#f00"/></svg>';
+    }) as typeof fsPromises.readFile);
+    syncBuiltinESMExports();
+    context.after(() => {
+      read.mock.restore();
+      syncBuiltinESMExports();
+    });
+    const old = fakeKey("delayed-fixed-title");
+    deck.controller.registerFixedAction(old.action, { kind: "local", keycapId: "delayed-title-keycap" });
+    await reachedRead.promise;
+    let replacement: FakeKey | undefined;
+    if (outcome === "stop") deck.controller.stop();
+    else {
+      deck.controller.unregisterFixedAction({ id: old.action.id });
+      if (outcome === "replacement") {
+        replacement = fakeKey(old.action.id);
+        deck.controller.registerFixedAction(replacement.action, { kind: "local", keycapId: "delayed-title-keycap" });
+      }
+    }
+    gate.resolve();
+    await drain();
+    assert.deepEqual(old.titles, [], "a retired action cannot re-create a title clear");
+    assert.deepEqual(old.images, [], "a retired action sends no delayed image");
+    if (replacement) {
+      assert.equal(replacement.images.length, 1);
+      assert.deepEqual(replacement.titles, [""]);
+    }
+    if (outcome === "stop") {
+      await deck.controller.start();
+      assert.equal(old.images.length, 1, "the current fixed registration still renders after restart");
+      assert.deepEqual(old.titles, [""]);
+    }
+  });
+}

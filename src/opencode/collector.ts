@@ -385,6 +385,8 @@ export class OpenCodeCollector {
     let complete = rootPage.complete;
     const requested = [...new Set([...activeIds, ...attentionIds])];
     const lineages = new Map<string, RawSession[]>();
+    // Scoped to this connection and cycle: identity checks and later refreshes still read fresh data.
+    const sessionRequests = new Map<string, Promise<RawSession>>();
     await mapConcurrent(requested, 4, async (id) => {
       const lineage: RawSession[] = [];
       let currentId: string | undefined = id;
@@ -398,9 +400,14 @@ export class OpenCodeCollector {
             complete = false;
             break;
           }
-          current = parseSessionEnvelope(
-            await this.client.fetchJson(connection, `/api/session/${encodeURIComponent(currentId)}`),
-          );
+          let request = sessionRequests.get(currentId);
+          if (!request) {
+            request = this.client
+              .fetchJson(connection, `/api/session/${encodeURIComponent(currentId)}`)
+              .then(parseSessionEnvelope);
+            sessionRequests.set(currentId, request);
+          }
+          current = await request;
           if (sessions.size >= MAX_SESSIONS) {
             complete = false;
             break;

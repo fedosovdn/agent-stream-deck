@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,13 @@ const THREAD_KEY = /(?:^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 const COMPLETION_FRESHNESS_MS = 5 * 60_000;
 const WORK_START_RETENTION_MS = 24 * 60 * 60_000;
 const MAX_RETAINED_WORK_STARTS = 512;
+const MAX_CACHED_SESSION_STATUSES = 512;
+
+type SessionStatus = Pick<
+  HostSessionPresence,
+  "status" | "completionRevision" | "contextUsedPercent" | "workStartedAt" | "workStartRevision"
+> & { activityAt?: number };
+type CachedSessionStatus = { signature: string; status: SessionStatus };
 
 type WorkStartPair = { workStartedAt: number; workStartRevision: number };
 type WorkStartRecord = WorkStartPair & { lastSeenAt: number };
@@ -20,6 +28,7 @@ export class CodexSessionOwnershipIndex {
   private contextParsedSessions = new Set<string>();
   private attemptedContextSessions = new Set<string>();
   private retainedWorkStarts = new Map<string, WorkStartRecord>();
+  private parsedSessionStatuses = new Map<string, CachedSessionStatus>();
   private refreshedAt = 0;
   private refreshInFlight?: Promise<void>;
 
@@ -124,7 +133,7 @@ export class CodexSessionOwnershipIndex {
   private async refresh(now: number, trackedSessions: Set<string>): Promise<void> {
     const next = new Set<string>();
     const sessionFiles: Array<{ threadId: string; path: string }> = [];
-    const files: Array<{ threadId: string; path: string; activityAt: number }> = [];
+    const files: Array<{ threadId: string; path: string; activityAt: number; signature: string }> = [];
     for (const root of this.roots) {
       try {
         const entries = await readdir(root, { recursive: true, withFileTypes: true });
@@ -150,7 +159,7 @@ export class CodexSessionOwnershipIndex {
         batch.map(async ({ threadId, path }) => {
           try {
             const info = await stat(path);
-            return { threadId, path, activityAt: info.mtimeMs };
+            return { threadId, path, activityAt: info.mtimeMs, signature: sessionFileSignature(info) };
           } catch {
             return null;
           }
@@ -171,10 +180,23 @@ export class CodexSessionOwnershipIndex {
     );
     const filesToRead = [...recent, ...trackedExtra];
     const contextParsed = new Set<string>();
+    const nextParsedStatuses = new Map<string, CachedSessionStatus>();
     const presence = await Promise.all(
-      filesToRead.map(async ({ threadId, path, activityAt: fileActivityAt }) => {
+      filesToRead.map(async ({ threadId, path, activityAt: fileActivityAt, signature }) => {
         const shouldRead = now - fileActivityAt <= 15 * 60_000 || trackedSessions.has(threadId);
-        const recentStatus = shouldRead ? await readRecentSessionStatus(path) : { status: "idle" as const };
+        let recentStatus: SessionStatus = { status: "idle" };
+        if (shouldRead) {
+          const cached = this.parsedSessionStatuses.get(path);
+          const parsed = cached?.signature === signature ? cached : await readRecentSessionStatus(path);
+          if (parsed) {
+            recentStatus = parsed.status;
+            // Cache only a complete successful read of the file observed by
+            // this scan. Replacement, truncation and writes invalidate it.
+            if (parsed.signature === signature && nextParsedStatuses.size < MAX_CACHED_SESSION_STATUSES) {
+              nextParsedStatuses.set(path, parsed);
+            }
+          }
+        }
         if (shouldRead) contextParsed.add(threadId);
         const { activityAt, ...status } = recentStatus;
         const observedWorkStart = workStartFields(recentStatus);
@@ -189,6 +211,7 @@ export class CodexSessionOwnershipIndex {
       }),
     );
     this.trackedSessionPresence = new Map(presence.map((session) => [session.threadId, session]));
+    this.parsedSessionStatuses = nextParsedStatuses;
     this.recentSessions = recent.map((file) => this.trackedSessionPresence.get(file.threadId)!);
     this.contextParsedSessions = contextParsed;
     this.attemptedContextSessions = new Set(trackedSessions);
@@ -234,21 +257,18 @@ function defaultSessionRoots(): string[] {
   return [join(codexHome, "sessions"), join(codexHome, "archived_sessions")];
 }
 
-async function readRecentSessionStatus(
-  path: string,
-): Promise<
-  Pick<
-    HostSessionPresence,
-    "status" | "completionRevision" | "contextUsedPercent" | "workStartedAt" | "workStartRevision"
-  > & { activityAt?: number }
-> {
+function sessionFileSignature(info: Stats): string {
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+}
+
+async function readRecentSessionStatus(path: string): Promise<CachedSessionStatus | null> {
   try {
     const handle = await open(path, "r");
     try {
       const info = await handle.stat();
       const length = Math.min(info.size, 512 * 1024);
       const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, Math.max(0, info.size - length));
+      const { bytesRead } = await handle.read(buffer, 0, length, Math.max(0, info.size - length));
       const tail = buffer.toString("utf8");
       const baseOffset = info.size - length;
       let lifecycle: "idle" | "working" | "complete" | undefined;
@@ -300,27 +320,39 @@ async function readRecentSessionStatus(
       }
       const contextUsedPercent = readContextUsedPercent(tail);
       const workStart = workStartedAt != null && workStartRevision != null ? { workStartedAt, workStartRevision } : {};
+      // A short read can race a truncation. Preserve the current result but
+      // force another read next time rather than retaining the partial tail.
+      const signature = bytesRead === length ? sessionFileSignature(info) : "";
       if (lifecycle === "working")
         return {
-          status: "working",
-          ...(activityAt != null ? { activityAt } : {}),
-          ...(contextUsedPercent != null ? { contextUsedPercent } : {}),
-          ...workStart,
+          signature,
+          status: {
+            status: "working",
+            ...(activityAt != null ? { activityAt } : {}),
+            ...(contextUsedPercent != null ? { contextUsedPercent } : {}),
+            ...workStart,
+          },
         };
       if (lifecycle === "complete" && completionRevision != null)
         return {
-          status: "complete",
-          completionRevision,
-          ...(activityAt != null ? { activityAt } : {}),
-          ...(contextUsedPercent != null ? { contextUsedPercent } : {}),
-          ...workStart,
+          signature,
+          status: {
+            status: "complete",
+            completionRevision,
+            ...(activityAt != null ? { activityAt } : {}),
+            ...(contextUsedPercent != null ? { contextUsedPercent } : {}),
+            ...workStart,
+          },
         };
-      return { status: "idle", ...(contextUsedPercent != null ? { contextUsedPercent } : {}), ...workStart };
+      return {
+        signature,
+        status: { status: "idle", ...(contextUsedPercent != null ? { contextUsedPercent } : {}), ...workStart },
+      };
     } finally {
       await handle.close();
     }
   } catch {
-    return { status: "idle" };
+    return null;
   }
 }
 

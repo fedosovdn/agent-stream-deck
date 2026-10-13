@@ -45,6 +45,7 @@ type AgentRegistration = { action: KeyAction<{}>; slot: number };
 type MicroActionRegistration = { action: KeyAction<{}>; slot: MicroActionSlot };
 type UsageLimitRegistration = { action: KeyAction<{}>; mode: UsageLimitMode };
 type ActionIdentity = { id: string };
+type TitleClearState = { action: KeyAction<{}>; revision: number; cleared: boolean; pending?: Promise<void> };
 type AgentPress = { assignment?: RoutedAgentSlot; down: Promise<void>; abort: AbortController };
 type AgentButton = { press?: AgentPress; active: Set<AgentPress>; tail?: Promise<void> };
 export type AgentDisplaySettings = {
@@ -63,6 +64,8 @@ export class DeckController {
   private readonly fixedActions = new Map<string, FixedIconRegistration>();
   private readonly keycapImages = new Map<string, Promise<string | null>>();
   private readonly lastImages = new Map<string, string>();
+  private readonly titleClears = new Map<string, TitleClearState>();
+  private titleListener?: ReturnType<typeof streamDeck.actions.onTitleParametersDidChange>;
   private readonly hostToggleActions = new Map<string, KeyAction<{}>>();
   private readonly usageLimitActions = new Map<string, UsageLimitRegistration>();
   private readonly usageOverviewActions = new Map<string, KeyAction<{}>>();
@@ -100,6 +103,15 @@ export class DeckController {
 
   async start(): Promise<void> {
     this.stopped = false;
+    this.titleListener?.dispose();
+    this.titleListener = streamDeck.actions.onTitleParametersDidChange((event) => {
+      if (!event.payload.title) return;
+      const state = this.titleClears.get(event.action.id);
+      if (state) {
+        state.revision++;
+        state.cleared = false;
+      }
+    });
     await this.loadAgentDisplaySettings();
     await this.codex.start();
     await this.syncTaskSourceDemand();
@@ -121,6 +133,9 @@ export class DeckController {
 
   stop(): void {
     this.stopped = true;
+    this.titleListener?.dispose();
+    this.titleListener = undefined;
+    this.titleClears.clear();
     if (this.poll) clearInterval(this.poll);
     if (this.animation) clearInterval(this.animation);
     for (const button of this.agentButtons.values()) for (const press of button.active) press.abort.abort();
@@ -131,6 +146,7 @@ export class DeckController {
   }
 
   registerAgent(slot: number, action: KeyAction<{}>): void {
+    this.resetTitleClear(action);
     this.agents.set(action.id, { action, slot });
     void this.renderAgent({ action, slot });
   }
@@ -171,6 +187,7 @@ export class DeckController {
   }
 
   registerMicroAction(slot: MicroActionSlot, action: KeyAction<{}>): void {
+    this.resetTitleClear(action);
     this.microActions.set(action.id, { action, slot });
     void this.renderMicroAction({ action, slot });
   }
@@ -180,6 +197,7 @@ export class DeckController {
   }
 
   registerFixedAction(action: KeyAction<{}>, source: FixedIconSource): void {
+    this.resetTitleClear(action);
     this.fixedActions.set(action.id, { action, source });
     void this.renderFixedAction({ action, source });
   }
@@ -189,22 +207,24 @@ export class DeckController {
   }
 
   registerHostToggle(action: KeyAction<{}>): void {
+    this.resetTitleClear(action);
     this.hostToggleActions.set(action.id, action);
     void this.renderHostToggle(action);
   }
 
   unregisterHostToggle(action: ActionIdentity): void {
-    this.hostToggleActions.delete(action.id);
-    this.lastImages.delete(action.id);
+    this.unregister(action, this.hostToggleActions);
   }
 
   registerUsageLimit(action: KeyAction<{}>, mode: UsageLimitMode): void {
+    this.resetTitleClear(action);
     const registration = { action, mode };
     this.usageLimitActions.set(action.id, registration);
     this.renderUsageAction("Usage limit", action, () => this.renderUsageLimit(registration));
   }
 
   updateUsageLimitMode(action: KeyAction<{}>, mode: UsageLimitMode): void {
+    if (this.usageLimitActions.get(action.id)?.action !== action) this.resetTitleClear(action);
     const registration = { action, mode };
     this.usageLimitActions.set(action.id, registration);
     this.renderUsageAction("Usage limit", action, () => this.renderUsageLimit(registration));
@@ -215,6 +235,7 @@ export class DeckController {
   }
 
   registerUsageOverview(action: KeyAction<{}>): void {
+    this.resetTitleClear(action);
     this.usageOverviewActions.set(action.id, action);
     this.renderUsageAction("Usage overview", action, () => this.renderUsageOverview(action));
   }
@@ -224,6 +245,7 @@ export class DeckController {
   }
 
   registerRateLimitReset(action: KeyAction<{}>): void {
+    this.resetTitleClear(action);
     this.rateLimitResetActions.set(action.id, action);
     this.renderUsageAction("Rate-limit reset", action, () => this.renderRateLimitReset(action));
   }
@@ -550,9 +572,51 @@ export class DeckController {
   }
 
   private async setImage(action: KeyAction<{}>, image: string): Promise<void> {
-    if (this.lastImages.get(action.id) === image) return;
-    await Promise.all([action.setImage(image), action.setTitle("")]);
-    this.lastImages.set(action.id, image);
+    if (this.stopped) return;
+    let state = this.titleClears.get(action.id);
+    if (!state) {
+      const registeredAction =
+        this.agents.get(action.id)?.action ??
+        this.microActions.get(action.id)?.action ??
+        this.fixedActions.get(action.id)?.action ??
+        this.hostToggleActions.get(action.id) ??
+        this.usageLimitActions.get(action.id)?.action ??
+        this.usageOverviewActions.get(action.id) ??
+        this.rateLimitResetActions.get(action.id);
+      if (registeredAction !== action) return;
+      state = { action, revision: 0, cleared: false };
+      this.titleClears.set(action.id, state);
+    }
+    if (state.action !== action) return;
+    if (this.lastImages.get(action.id) === image && state.cleared) return;
+    const updateImage =
+      this.lastImages.get(action.id) === image
+        ? Promise.resolve()
+        : action.setImage(image).then(() => {
+            if (this.titleClears.get(action.id) === state) this.lastImages.set(action.id, image);
+          });
+    await Promise.all([updateImage, this.clearTitle(state)]);
+  }
+
+  private resetTitleClear(action: KeyAction<{}>): void {
+    this.titleClears.set(action.id, { action, revision: 0, cleared: false });
+  }
+
+  private clearTitle(state: TitleClearState): Promise<void> {
+    if (state.cleared) return Promise.resolve();
+    if (state.pending) return state.pending;
+    const revision = state.revision;
+    state.pending = state.action.setTitle("").then(
+      () => {
+        if (state.revision === revision) state.cleared = true;
+        state.pending = undefined;
+      },
+      (error) => {
+        state.pending = undefined;
+        throw error;
+      },
+    );
+    return state.pending;
   }
 
   private effectiveActiveQueueEnabled(): boolean {
@@ -568,6 +632,7 @@ export class DeckController {
   private unregister<T>(action: ActionIdentity, registrations: Map<string, T>): void {
     registrations.delete(action.id);
     this.lastImages.delete(action.id);
+    this.titleClears.delete(action.id);
   }
 
   private scheduleRefresh(): void {

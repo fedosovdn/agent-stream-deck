@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -40,6 +41,7 @@ const WATCHER_LAUNCHER_PATH = join(STATE_ROOT, "watcher-launch.sh");
 const LAUNCH_AGENT_PATH = join(homedir(), "Library", "LaunchAgents", `${AGENT_LABEL}.plist`);
 const POLL_MS = 1_000;
 const LOG_LIMIT_BYTES = 1_000_000;
+const INSTALLATION_METADATA_LIMIT = 128;
 
 type CodexInstallation = {
   appPath: string;
@@ -49,6 +51,12 @@ type CodexInstallation = {
   executableName: string;
   executablePath: string;
 };
+
+const installationMetadata = new Map<string, { fingerprint: string; installation: CodexInstallation | null }>();
+
+function plistFingerprint(value: Stats): string {
+  return [value.dev, value.ino, value.size, value.mtimeMs, value.ctimeMs].join(":");
+}
 
 type MainProcess = {
   pid: number;
@@ -111,21 +119,41 @@ function appPathFromExecutable(command: string): string | null {
 async function installationFromApp(appPath: string): Promise<CodexInstallation | null> {
   const infoPath = join(appPath, "Contents", "Info.plist");
   try {
-    const bundleId = plistValue(infoPath, "CFBundleIdentifier");
-    if (bundleId !== CODEX_BUNDLE_ID) return null;
-    const executableName = plistValue(infoPath, "CFBundleExecutable");
-    const executablePath = join(appPath, "Contents", "MacOS", executableName);
-    const executable = await stat(executablePath);
-    if (!executable.isFile()) throw new Error(`Codex executable is not a file: ${executablePath}`);
-    return {
-      appPath,
-      bundleId,
-      version: plistValue(infoPath, "CFBundleShortVersionString"),
-      buildVersion: plistValue(infoPath, "CFBundleVersion"),
-      executableName,
-      executablePath,
-    };
+    const fingerprint = plistFingerprint(await stat(infoPath));
+    const cached = installationMetadata.get(appPath);
+    let installation: CodexInstallation | null;
+    if (cached?.fingerprint === fingerprint) {
+      installation = cached.installation;
+    } else {
+      const bundleId = plistValue(infoPath, "CFBundleIdentifier");
+      installation = null;
+      if (bundleId === CODEX_BUNDLE_ID) {
+        const executableName = plistValue(infoPath, "CFBundleExecutable");
+        installation = {
+          appPath,
+          bundleId,
+          version: plistValue(infoPath, "CFBundleShortVersionString"),
+          buildVersion: plistValue(infoPath, "CFBundleVersion"),
+          executableName,
+          executablePath: join(appPath, "Contents", "MacOS", executableName),
+        };
+      }
+    }
+    if (installation && !(await stat(installation.executablePath)).isFile()) {
+      throw new Error(`Codex executable is not a file: ${installation.executablePath}`);
+    }
+    // Separate plutil reads must describe one unchanged file, including atomic replacements.
+    if (fingerprint !== plistFingerprint(await stat(infoPath))) {
+      installationMetadata.delete(appPath);
+      return null;
+    }
+    installationMetadata.set(appPath, { fingerprint, installation });
+    while (installationMetadata.size > INSTALLATION_METADATA_LIMIT) {
+      installationMetadata.delete(installationMetadata.keys().next().value!);
+    }
+    return installation ? { ...installation } : null;
   } catch {
+    installationMetadata.delete(appPath);
     return null;
   }
 }
@@ -162,9 +190,16 @@ export async function discoverCodexInstallation(): Promise<CodexInstallation> {
   if (spotlight) candidates.push(...spotlight.split("\n").filter((path) => path.endsWith(".app")));
   candidates.push(...(await standardAppCandidates()));
 
+  const uniqueCandidates = new Set(candidates);
+  for (const cachedPath of installationMetadata.keys()) {
+    if (!uniqueCandidates.has(cachedPath)) installationMetadata.delete(cachedPath);
+  }
   const installations: CodexInstallation[] = [];
-  for (const candidate of [...new Set(candidates)]) {
-    if (!(await isDirectory(candidate))) continue;
+  for (const candidate of uniqueCandidates) {
+    if (!(await isDirectory(candidate))) {
+      installationMetadata.delete(candidate);
+      continue;
+    }
     const installation = await installationFromApp(candidate);
     if (installation) installations.push(installation);
   }

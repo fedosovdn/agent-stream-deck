@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import fs, { appendFile, mkdir, mkdtemp, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -221,6 +222,138 @@ test("an old completion uses its event timestamp and cannot flash as newly compl
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("unchanged rollout parsing keeps freshness and invalidates on append, replacement, truncation and removal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-deck-rollout-invalidation-"));
+  try {
+    const threadId = "10000000-0000-4000-8000-000000000015";
+    const path = join(root, `rollout-now-${threadId}.jsonl`);
+    const now = Date.parse("2026-07-21T20:00:00.000Z");
+    let complete = '{"timestamp":"2026-07-21T20:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}\n';
+    const working = '{"timestamp":"2026-07-21T20:00:00.000Z","type":"event_msg","payload":{"type":"task_started" }}\n';
+    assert.equal(Buffer.byteLength(complete), Buffer.byteLength(working));
+    await writeFile(path, complete);
+    const index = new CodexSessionOwnershipIndex([root], 0);
+    const value = snapshotFor(threadId, false);
+    assert.equal((await index.annotate(value, now + 1)).slots[0]!.status, "complete");
+    assert.equal((await index.annotate(value, now + 2)).slots[0]!.status, "complete");
+    assert.equal((await index.annotate(value, now + 300_001)).slots[0]!.status, "idle");
+
+    await appendFile(path, working);
+    assert.equal((await index.annotate(value, now + 300_002)).slots[0]!.status, "working");
+    complete = complete.replace("20:00:00", "20:05:00");
+    await writeFile(path, complete);
+    assert.equal((await index.annotate(value, now + 300_003)).slots[0]!.status, "complete");
+
+    // Replacing a file may preserve its length and modification time. Its
+    // identity must still invalidate the old parsed completion.
+    const previous = await stat(path);
+    const replacement = join(root, "replacement.jsonl");
+    await writeFile(replacement, working);
+    await utimes(replacement, previous.atime, previous.mtime);
+    await rename(replacement, path);
+    assert.equal((await index.annotate(value, now + 300_004)).slots[0]!.status, "working");
+    await writeFile(path, "{}\n");
+    assert.equal((await index.annotate(value, now + 300_005)).slots[0]!.status, "idle");
+    await rm(path);
+    const removed = await index.annotate(value, now + 300_006);
+    assert.equal(removed.slots[0]!.ownedByHost, false);
+    assert.equal(
+      removed.hostSessions?.some((session) => session.threadId === threadId),
+      false,
+    );
+    await writeFile(path, complete);
+    assert.equal((await index.annotate(value, now + 300_007)).slots[0]!.status, "complete");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const failure of ["open error", "short read"] as const) {
+  test(`an unchanged rollout is retried after a transient ${failure}`, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), "codex-deck-rollout-read-retry-"));
+    const originalOpen = fs.open;
+    let failNextRead = true;
+    const mockedOpen = context.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      if (failNextRead && failure === "open error") {
+        failNextRead = false;
+        throw new Error("Synthetic transient read failure");
+      }
+      const handle = await originalOpen(...args);
+      if (failNextRead) {
+        failNextRead = false;
+        const originalRead = handle.read.bind(handle);
+        context.mock.method(handle, "read", async (buffer: Buffer, offset: number, length: number, position: number) =>
+          originalRead(buffer, offset, Math.floor(length / 2), position),
+        );
+      }
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      const threadId = "10000000-0000-4000-8000-000000000016";
+      await writeFile(
+        join(root, `rollout-now-${threadId}.jsonl`),
+        '{"type":"event_msg","payload":{"type":"task_started"}}\n',
+      );
+      const index = new CodexSessionOwnershipIndex([root], 0);
+      const value = snapshotFor(threadId, false);
+      assert.equal((await index.annotate(value, 1_000)).slots[0]!.status, "idle");
+      assert.equal((await index.annotate(value, 1_001)).slots[0]!.status, "working");
+    } finally {
+      mockedOpen.mock.restore();
+      syncBuiltinESMExports();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const change of ["replacement", "append"] as const) {
+  test(`a rollout ${change} between scan and open is retried before successful reuse`, async (context) => {
+    const root = await mkdtemp(join(tmpdir(), "codex-deck-rollout-scan-race-"));
+    const threadId = "10000000-0000-4000-8000-000000000017";
+    const path = join(root, `rollout-now-${threadId}.jsonl`);
+    const originalOpen = fs.open;
+    let changeBeforeOpen = true;
+    let reads = 0;
+    const complete = '{"type":"event_msg","payload":{"type":"task_complete"}}\n';
+    const mockedOpen = context.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      if (changeBeforeOpen) {
+        changeBeforeOpen = false;
+        if (change === "replacement") {
+          await writeFile(`${path}.replacement`, complete);
+          await rename(`${path}.replacement`, path);
+        } else {
+          await appendFile(path, complete);
+        }
+      }
+      const handle = await originalOpen(...args);
+      const originalRead = handle.read.bind(handle);
+      context.mock.method(handle, "read", async (...values: Parameters<typeof handle.read>) => {
+        reads += 1;
+        return originalRead(...values);
+      });
+      return handle;
+    });
+    syncBuiltinESMExports();
+    try {
+      await writeFile(path, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+      const index = new CodexSessionOwnershipIndex([root], 0);
+      const value = snapshotFor(threadId, false);
+      assert.equal((await index.annotate(value, Date.now())).slots[0]!.status, "complete");
+      assert.equal((await index.annotate(value, Date.now() + 1)).slots[0]!.status, "complete");
+      // The scan did not describe the opened file. Retry once instead of
+      // retaining that raced observation, then reuse the stable successful read.
+      assert.equal(reads, 2);
+      assert.equal((await index.annotate(value, Date.now() + 2)).slots[0]!.status, "complete");
+      assert.equal(reads, 2);
+    } finally {
+      mockedOpen.mock.restore();
+      syncBuiltinESMExports();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("rollout token counts expose bounded per-thread context usage without task content", async () => {
   const root = await mkdtemp(join(tmpdir(), "codex-deck-context-"));
@@ -454,41 +587,66 @@ test("a missing tracked catalog identity is negatively cached until the planned 
   }
 });
 
-test("a tracked old session outside the public recent 128 is still read for catalog annotation", async () => {
+test("tracked catalogs beyond the cache bound keep all outcomes and the newest duplicate", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "codex-deck-tracked-old-"));
+  const originalOpen = fs.open;
+  let reads = 0;
+  const mockedOpen = context.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    const originalRead = handle.read.bind(handle);
+    context.mock.method(handle, "read", async (...values: Parameters<typeof handle.read>) => {
+      reads += 1;
+      return originalRead(...values);
+    });
+    return handle;
+  });
+  syncBuiltinESMExports();
   try {
-    const trackedId = "20000000-0000-4000-8000-000000000000";
-    const trackedPath = join(root, `rollout-old-${trackedId}.jsonl`);
-    await writeFile(trackedPath, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
-    await utimes(trackedPath, new Date(1_000), new Date(1_000));
-    for (let index = 1; index <= 129; index += 1) {
-      const id = `20000000-0000-4000-8000-${index.toString().padStart(12, "0")}`;
-      await writeFile(join(root, `rollout-new-${id}.jsonl`), "{}\n");
+    const now = Date.parse("2026-07-21T20:00:00.000Z");
+    const ids = Array.from({ length: 520 }, (_, index) => `20000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+    for (const [index, id] of ids.entries()) {
+      const path = join(root, `rollout-now-${id}.jsonl`);
+      await writeFile(
+        path,
+        `{"timestamp":"2026-07-21T20:00:00.000Z","type":"event_msg","payload":{"type":"${index % 2 ? "task_complete" : "task_started"}"}}\n`,
+      );
+      await utimes(path, now / 1000, index === 0 ? 1 : (now - 520 + index) / 1000);
     }
+    const duplicate = join(root, `rollout-old-${ids[0]}.jsonl`);
+    await writeFile(duplicate, '{"type":"event_msg","payload":{"type":"task_complete"}}\n');
+    await utimes(duplicate, 0.5, 0.5);
     const value = snapshot();
     value.activeCatalog = {
       complete: true,
-      candidates: [
-        {
-          threadKey: `local:${trackedId}`,
-          conversationId: trackedId,
-          title: "Tracked old",
-          status: "unread",
-          selected: false,
-          catalogIndex: 129,
-        },
-      ],
+      candidates: ids.map((id, catalogIndex) => ({
+        threadKey: `local:${id}`,
+        conversationId: id,
+        title: "Tracked",
+        status: "working",
+        selected: false,
+        catalogIndex,
+      })),
     };
 
-    const annotated = await new CodexSessionOwnershipIndex([root], 60_000).annotate(value, Date.now());
-    assert.equal(annotated.hostSessions?.length, 128);
-    assert.equal(
-      annotated.hostSessions?.some((session) => session.threadId === trackedId),
-      false,
+    const index = new CodexSessionOwnershipIndex([root], 0);
+    const annotated = await index.annotate(value, now + 1);
+    assert.deepEqual(
+      annotated.hostSessions?.map((session) => session.threadId),
+      ids.slice(-128).reverse(),
     );
-    assert.equal(annotated.activeCatalog?.candidates[0]?.ownedByHost, true);
-    assert.equal(annotated.activeCatalog?.candidates[0]?.status, "working");
+    assert.deepEqual(
+      annotated.activeCatalog?.candidates.map((candidate) => [candidate.ownedByHost, candidate.status]),
+      ids.map((_, index) => [true, index % 2 ? "complete" : "working"]),
+    );
+    assert.equal(reads, 520);
+    reads = 0;
+    assert.deepEqual(await index.annotate(value, now + 2), annotated);
+    // At most 512 successful tails may be retained, regardless of which
+    // concurrent reads finish first. Unchanged retained tails must be reused.
+    assert.ok(reads >= 8 && reads < 520, `expected bounded successful reuse, observed ${reads} reads`);
   } finally {
+    mockedOpen.mock.restore();
+    syncBuiltinESMExports();
     await rm(root, { recursive: true, force: true });
   }
 });

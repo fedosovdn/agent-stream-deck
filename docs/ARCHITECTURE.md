@@ -148,6 +148,13 @@ its byte offset becomes the monotonic `workStartRevision`; background reasoning,
 tool and assistant output, title or selection changes, renderer activity, and
 snapshot refreshes remain general activity and do not change working rank.
 
+The ownership reader still scans directories and checks file metadata on each
+scheduled refresh. It reuses only successful parsed tails whose device, inode,
+size, modification time, and metadata-change time remain unchanged, retaining at
+most 512 normalized records without file contents. File changes, replacement,
+removal, short reads, and errors prevent reuse; completion freshness is evaluated
+against the current time even when parsing is reused.
+
 The long-lived controller owns an in-memory queue epoch. A trustworthy start is
 ranked once after clock normalization; repeated or lower revisions remain fixed,
 while a higher revision from the task's current exact owner moves it to the front

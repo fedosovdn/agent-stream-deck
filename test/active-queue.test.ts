@@ -157,7 +157,7 @@ test("active queue orders attention and completion as before, then seeds trusted
 
 test("active queue uses owning host session activity only for completion FIFO", () => {
   const completedLater = thread(21);
-  const completedEarlier = thread(22);
+  const completedEarlier = "abcdef00-abcd-4000-8000-000000000022";
   const workingOlder = thread(23);
   const workingNewer = thread(24);
   const slots = [
@@ -167,12 +167,20 @@ test("active queue uses owning host session activity only for completion FIFO", 
     trusted(routed(3, "working", 20, mac, workingNewer), 400, 1),
   ];
   const inputs = [
+    snapshot(mac, [{ threadId: completedEarlier, activityAt: 5_000, status: "complete" }]),
     snapshot(mac, [
-      { threadId: completedEarlier, activityAt: 100, status: "complete" },
+      { threadId: `local:${completedEarlier.toUpperCase()}`, activityAt: 100, status: "complete" },
+      { threadId: completedEarlier, activityAt: Number.NaN, status: "complete" },
+      { threadId: completedEarlier, activityAt: Number.POSITIVE_INFINITY, status: "complete" },
+      { threadId: completedEarlier, activityAt: 0, status: "complete" },
+      { threadId: completedEarlier, activityAt: -1, status: "complete" },
+      { threadId: completedLater, activityAt: 50, status: "complete" },
       { threadId: workingNewer, activityAt: 400, status: "working" },
     ]),
     snapshot(windows, [
       { threadId: completedLater, activityAt: 200, status: "complete" },
+      { threadId: completedLater, activityAt: 50, status: "complete" },
+      { threadId: completedEarlier, activityAt: 500, status: "complete" },
       { threadId: workingOlder, activityAt: 300, status: "working" },
     ]),
   ];
@@ -185,6 +193,27 @@ test("active queue uses owning host session activity only for completion FIFO", 
   );
   assert.equal(projected[0]!.host.hostId, mac.hostId);
   assert.equal(projected[1]!.host.hostId, windows.hostId);
+});
+
+test("completion FIFO keeps OpenCode and T3 activity independent of Codex sessions", () => {
+  const slots = [
+    { ...routed(0, "complete", 75, mac, "Connection:SessionA"), taskSource: "opencode" as const },
+    { ...routed(1, "complete", 85, mac, "Connection:sessiona"), taskSource: "t3code" as const },
+    routed(2, "complete", 500, mac, thread(25)),
+    routed(3, "complete", 80, mac, thread(26)),
+  ];
+  const inputs = [
+    snapshot(mac, [
+      { threadId: "Connection:SessionA", activityAt: 900, status: "complete" },
+      { threadId: "Connection:sessiona", activityAt: 10, status: "complete" },
+      { threadId: thread(25), activityAt: 90, status: "complete" },
+      { threadId: thread(26), activityAt: Number.POSITIVE_INFINITY, status: "complete" },
+    ]),
+  ];
+
+  const projected = projectActiveQueue(slots, inputs);
+
+  assert.deepEqual(keys(projected), ["Connection:SessionA", thread(26), "Connection:sessiona", thread(25)]);
 });
 
 test("active queue puts trusted structural starts before unknown work and resolves stable ties", () => {

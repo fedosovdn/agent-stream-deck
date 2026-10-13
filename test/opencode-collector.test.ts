@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import nodeTest, { type TestContext } from "node:test";
+import { setImmediate as yieldIO } from "node:timers/promises";
 import { OpenCodeCollector, type OpenCodeCollectorDependencies, type OpenCodeProcess } from "#opencode";
 import { findOrphanedTunnels, sshCommonArgs, sshTunnelArgs, TUNNEL_FORWARD_PLACEHOLDER } from "../src/opencode/ssh.js";
 
@@ -159,6 +160,132 @@ function basicRoutes(now = 1_000_000): Record<string, RouteEntry> {
     }),
   };
 }
+
+test("shares pending ancestor reads only within one connection refresh and retries changed or failed data", async () => {
+  const now = 1_000_000;
+  let title = "First root";
+  let fail = false;
+  const children = ["ses_child1", "ses_child2", "ses_child3", "ses_child4"];
+  const routes = basicRoutes(now);
+  routes["/api/permission/request"] = response({ data: children.map((sessionID) => ({ sessionID })) });
+  routes["/api/session?parentID=null&order=desc&limit=100"] = response({ data: [], cursor: {} });
+  for (const id of children)
+    routes[`/api/session/${id}`] = response({ data: session(id, now, { parentID: "ses_parent" }) });
+  routes["/api/session/ses_parent"] = async () => {
+    // Let every ready child reach its parent while that response is still pending.
+    await yieldIO();
+    return fail ? response({}, 500) : response({ data: session("ses_parent", now, { parentID: "ses_root" }) });
+  };
+  routes["/api/session/ses_root"] = async () => {
+    await yieldIO();
+    return response({ data: session("ses_root", now, { title }) });
+  };
+  const setup = fixture({
+    now,
+    files: {
+      [`${STATE}/service.one.json`]: { body: localRegistration({ id: "one" }) },
+      [`${STATE}/service.two.json`]: { body: localRegistration({ id: "two", url: "http://127.0.0.1:4097" }) },
+    },
+    routes,
+  });
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  const parentReads = () =>
+    setup.requests.filter((request) => new URL(request.url).pathname === "/api/session/ses_parent");
+  try {
+    const first = await collector.start();
+    assert.deepEqual(
+      first.connections.map((connection) => [connection.health, connection.tasks[0]?.displayTitle]),
+      [
+        ["ready", "First root"],
+        ["ready", "First root"],
+      ],
+    );
+    assert.deepEqual(
+      parentReads()
+        .map((request) => new URL(request.url).port)
+        .sort(),
+      ["4096", "4097"],
+    );
+    assert.equal(
+      setup.requests.filter((request) => new URL(request.url).pathname === "/api/session/ses_root").length,
+      2,
+    );
+    title = "Changed root";
+    const changed = await collector.refresh();
+    assert.deepEqual(
+      changed.connections.map((connection) => connection.tasks[0]?.displayTitle),
+      ["Changed root", "Changed root"],
+    );
+    assert.equal(parentReads().length, 4);
+    fail = true;
+    const failed = await collector.refresh();
+    assert.deepEqual(
+      failed.connections.map((connection) => [connection.health, connection.tasks]),
+      [
+        ["unavailable", []],
+        ["unavailable", []],
+      ],
+    );
+    fail = false;
+    const recovered = await collector.refresh();
+    assert.deepEqual(
+      recovered.connections.map((connection) => connection.health),
+      ["ready", "ready"],
+    );
+    assert.equal(parentReads().length, 8);
+  } finally {
+    await collector.stop();
+  }
+});
+
+test("shared ancestor reads retain cycle, depth and session capacity guards", async () => {
+  for (const kind of ["cycle", "depth", "capacity"] as const) {
+    const routes = basicRoutes();
+    const children = Array.from({ length: kind === "capacity" ? 200 : 4 }, (_, index) => `ses_child${index}`);
+    routes["/api/permission/request"] = response({ data: children.map((sessionID) => ({ sessionID })) });
+    routes["/api/session?parentID=null&order=desc&limit=100"] = response({
+      data: kind === "capacity" ? Array.from({ length: 100 }, (_, index) => session(`ses_root${index}`, 999_900)) : [],
+      cursor: {},
+    });
+    for (const id of children)
+      routes[`/api/session/${id}`] = response({
+        data: session(id, 999_900, { parentID: kind === "capacity" ? "ses_root0" : "ses_parent0" }),
+      });
+    for (let index = 0; index < 16; index++) {
+      const id = `ses_parent${index}`;
+      routes[`/api/session/${id}`] = async () => {
+        await yieldIO();
+        return response({ data: session(id, 999_900, { parentID: kind === "cycle" ? id : `ses_parent${index + 1}` }) });
+      };
+    }
+    const setup = fixture({ files: { [`${STATE}/service.json`]: { body: localRegistration() } }, routes });
+    const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+    try {
+      const snapshot = await collector.start();
+      assert.equal(snapshot.connections[0]!.health, kind === "cycle" ? "unavailable" : "capacity-exceeded", kind);
+      assert.equal(snapshot.connections[0]!.complete, false, kind);
+      assert.deepEqual(
+        snapshot.connections[0]!.tasks.map((task) => task.sessionId),
+        kind === "capacity" ? ["ses_root0"] : [],
+        kind,
+      );
+      assert.equal(
+        setup.requests.some((request) => new URL(request.url).pathname === "/api/session/ses_parent15"),
+        false,
+        "the 16-level budget includes the child",
+      );
+      const childReads = setup.requests.filter((request) =>
+        new URL(request.url).pathname.startsWith("/api/session/ses_child"),
+      );
+      assert.ok(
+        childReads.length <= 103,
+        "100 roots leave room for 100 children, with at most three already pending reads",
+      );
+    } finally {
+      await collector.stop();
+    }
+  }
+});
 
 test("discovers a descriptor-approved local registration without publishing its endpoint or password", async () => {
   const setup = fixture({

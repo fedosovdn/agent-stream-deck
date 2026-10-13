@@ -171,6 +171,7 @@ export function projectActiveQueue(
   // Observe the full routed catalog before filtering and the six-item projection.
   rankIndex.observe(routedSlots, now);
   const sessionsByHost = new Map(inputs.map((input) => [input.host.hostId, input.snapshot.hostSessions ?? []]));
+  let sessionActivityByHost: Map<string, Map<string, number>> | undefined;
 
   return routedSlots
     .flatMap((slot): QueueCandidate[] => {
@@ -178,10 +179,16 @@ export function projectActiveQueue(
       const group = queueGroup(slot.status);
       if (group == null) return [];
       const identity = threadIdentity(slot.threadKey);
-      const sessionActivity =
-        group === "completion" && (!slot.taskSource || slot.taskSource === "codex")
-          ? newestMatchingSessionActivity(sessionsByHost.get(slot.host.hostId), identity)
-          : null;
+      let sessionActivity: number | null = null;
+      if (group === "completion" && (!slot.taskSource || slot.taskSource === "codex")) {
+        sessionActivityByHost ??= new Map();
+        let activities = sessionActivityByHost.get(slot.host.hostId);
+        if (!activities) {
+          activities = indexSessionActivity(sessionsByHost.get(slot.host.hostId));
+          sessionActivityByHost.set(slot.host.hostId, activities);
+        }
+        sessionActivity = activities.get(identity) ?? null;
+      }
       return [
         {
           slot,
@@ -276,17 +283,18 @@ function trustedStart(slot: RoutedAgentSlot): { startedAt: number; revision: num
     : null;
 }
 
-function newestMatchingSessionActivity(
+function indexSessionActivity(
   sessions: readonly { threadId: string; activityAt: number }[] | undefined,
-  identity: string,
-): number | null {
-  let newest: number | null = null;
+): Map<string, number> {
+  const activities = new Map<string, number>();
   for (const session of sessions ?? []) {
     const activityAt = validTimestamp(session.activityAt);
-    if (threadIdentity(session.threadId) === identity && activityAt != null && (newest == null || activityAt > newest))
-      newest = activityAt;
+    if (activityAt == null) continue;
+    const identity = threadIdentity(session.threadId);
+    const newest = activities.get(identity);
+    if (newest == null || activityAt > newest) activities.set(identity, activityAt);
   }
-  return newest;
+  return activities;
 }
 
 function compareText(left: string, right: string): number {
