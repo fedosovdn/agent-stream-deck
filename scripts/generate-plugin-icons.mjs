@@ -1,6 +1,7 @@
 import { deflateSync } from "node:zlib";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function crc32(buffer) {
   let crc = 0xffffffff;
@@ -88,11 +89,17 @@ function roundedRectDistance(x, y, centerX, centerY, halfWidth, halfHeight, radi
   return Math.hypot(Math.max(dx, 0), Math.max(dy, 0)) + Math.min(Math.max(dx, dy), 0) - radius;
 }
 
-for (const [name, size] of [
-  ["plugin-icon.png", 256],
-  ["plugin-icon@2x.png", 512],
-]) {
-  const path = resolve("static/imgs", name);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, png(size));
+export function generatePluginIcons(root = process.cwd()) {
+  for (const [name, size] of [
+    ["plugin-icon.png", 256],
+    ["plugin-icon@2x.png", 512],
+  ]) {
+    const path = resolve(root, "static/imgs", name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, png(size));
+  }
+}
+
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  generatePluginIcons();
 }

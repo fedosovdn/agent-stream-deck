@@ -1,7 +1,9 @@
 import { build } from "esbuild";
 import { cp, mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import "./generate-plugin-icons.mjs";
+import { ensurePluginIcons } from "./plugin-icons.mjs";
+
+await ensurePluginIcons();
 
 const output = resolve("dist/com.xonika9.codex-deck.sdPlugin");
 // Keep the package root itself because Windows may have a directory handle open
