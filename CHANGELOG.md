@@ -2,6 +2,32 @@
 
 Versions through `0.7.0.2` below are the historical upstream releases by Dazer. Starting with `1.0.0`, releases belong to the xonika9 fork and use its own plugin identity.
 
+## 2.2.0 - 2026-10-14
+
+### Highlights
+
+- Ready local OpenCode and T3 Code tasks now appear and continue updating while another connected environment is slow. Discovery, collection and publication are independent, with bounded concurrency and a reserved next opportunity for waiting local OpenCode work.
+- Codex, usage and T3 work no longer block one another's polling. Image delivery is serialized per key and coalesces pending updates, preserving the latest picture and the task captured when a press begins.
+
+### Fixes and performance
+
+- Reuse successfully parsed unchanged Codex session tails, index completion activity once per queue projection, share common OpenCode parent requests within a collection cycle, and avoid repeatedly clearing already-empty key titles.
+- Reuse verified macOS installation metadata and generated plugin icons. File replacement, truncation, failed reads and changed build inputs invalidate the relevant caches.
+- Concurrent first OpenCode starts share protected credential preparation. Retired source generations and late native-bridge responses cannot overwrite current tasks or confirmations; an index fork copies only committed observations.
+- A failed or removed environment drops its stale cards without hiding successful environments. Exact completion confirmations preserve newer results, and key replacement cannot redirect an in-progress press/release pair.
+
+### Build and compatibility
+
+- Distributable plugins use syntax/whitespace compression and source maps without embedded source text; development builds keep full source maps. Debugging a release requires its map and the matching repository revision.
+- Launcher archives include the existing author-provided JPEG referenced by both installation guides, reducing archive size. macOS and Windows launcher code remains uncompressed.
+- Existing action UUIDs, profiles, read-only usage actions and standalone Windows installation remain supported. T3 collection remains macOS-only; saved Fedora SSH connections remain task sources. Authentication, loopback binding, freshness rules and protective timeouts are preserved.
+
+### Validation
+
+- Local automated macOS validation passed with Node 24.16.0: clean dependency install, lint, import boundaries, types, 297 successful tests with two existing Windows-only skips, plugin validation, packaging, both archive integrity checks, checksums and release artifact auditing.
+- Five alternating synthetic comparisons confirmed local task publication during held remote work. A separate saturated-catalog run covered about 92000 synthetic tasks for ten minutes after warmup without retained-memory growth; measurement limitations and failed attempts remain recorded in the performance reports.
+- Live macOS validation confirmed refreshing cards and quota in Stream Deck 7.6.0. The maintainer confirmed matching physical-device images and a single read-only quota press without an error indicator on production code `1b2da42`, before the release-only version bump. The final versioned package was not separately tested on hardware. Native Windows application and device validation were not run.
+
 ## 2.1.1 - 2026-10-08
 
 ### Fixes
