@@ -2,6 +2,7 @@ import { build } from "esbuild";
 import { cp, mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { ensurePluginIcons } from "./plugin-icons.mjs";
+import { buildOptions } from "./build-options.mjs";
 
 await ensurePluginIcons();
 
@@ -35,14 +36,7 @@ await cp(
 await cp(resolve("static/property-inspector/agent.html"), resolve(output, "static/property-inspector/agent.html"));
 
 await build({
+  ...buildOptions("plugin", process.argv.includes("--release")),
   entryPoints: [resolve("src/plugin.ts")],
   outfile: resolve(output, "bin/plugin.mjs"),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  sourcemap: true,
-  banner: {
-    js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);",
-  },
 });

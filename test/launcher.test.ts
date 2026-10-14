@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -55,6 +57,37 @@ test("launcher build ships an explicit ws allowlist and LF macOS start scripts",
   assert.match(build, /"package\.json", "browser\.js", "index\.js", "wrapper\.mjs"/);
   assert.doesNotMatch(build, /cp\(resolve\("node_modules\/ws"\).*recursive: true/s);
   assert.match(build, /replace\(\/\\r\\n\/g, "\\n"\)/);
+});
+
+test("both launcher packages resolve the README cover links to the public JPEG", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-launcher-docs-"));
+  try {
+    for (const name of ["docs", "launcher", "README.md", "README.ru.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md"]) {
+      await cp(new URL(`../${name}`, import.meta.url), join(root, name), { recursive: true });
+    }
+    await mkdir(join(root, "node_modules"));
+    await cp(new URL("../node_modules/ws", import.meta.url), join(root, "node_modules/ws"), { recursive: true });
+    // Public docs packaging is the boundary here; unrelated runtime bundles use empty entries.
+    await writeFile(join(root, "launcher/runtime-override.ts"), "export {};\n");
+    await writeFile(join(root, "launcher/macos/codex-deck-macos.ts"), "export {};\n");
+    await execFileAsync(process.execPath, [fileURLToPath(new URL("../scripts/build-launcher.mjs", import.meta.url))], {
+      cwd: root,
+    });
+
+    for (const name of ["codex-deck-launcher", "codex-deck-launcher-macos"]) {
+      const output = join(root, "release", name);
+      for (const guide of ["README.md", "README.ru.md"]) {
+        assert.match(await readFile(join(output, guide), "utf8"), /src="docs\/assets\/codex-deck-hero\.jpg"/);
+      }
+      assert.deepEqual(
+        await readFile(join(output, "docs/assets/codex-deck-hero.jpg")),
+        await readFile(new URL("../docs/assets/codex-deck-hero.jpg", import.meta.url)),
+      );
+      await assert.rejects(access(join(output, "docs/assets/codex-deck-hero.png")), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("watcher recovery decision self-test passes in PowerShell", async (context) => {

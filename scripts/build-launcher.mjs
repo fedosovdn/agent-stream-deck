@@ -1,6 +1,7 @@
 import { build } from "esbuild";
 import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { buildOptions } from "./build-options.mjs";
 
 const output = resolve("release/codex-deck-launcher");
 const macOutput = resolve("release/codex-deck-launcher-macos");
@@ -10,14 +11,9 @@ await mkdir(output, { recursive: true });
 await mkdir(macOutput, { recursive: true });
 
 await build({
+  ...buildOptions("windows", process.argv.includes("--release")),
   entryPoints: [resolve("launcher/runtime-override.ts")],
   outfile: resolve(output, "runtime-override.mjs"),
-  bundle: true,
-  external: ["ws"],
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  minify: false,
 });
 
 // Copy the runtime package from an explicit allowlist. Cloud-sync conflict
@@ -52,16 +48,9 @@ for (const filename of ["Start Codex Deck.cmd", "Start-CodexDeck.ps1", "Watch-Co
 await copyPublicDocs(output);
 
 await build({
+  ...buildOptions("macos", process.argv.includes("--release")),
   entryPoints: [resolve("launcher/macos/codex-deck-macos.ts")],
   outfile: resolve(macOutput, "codex-deck-macos.mjs"),
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node24",
-  minify: false,
-  banner: {
-    js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);",
-  },
 });
 
 for (const filename of ["start-codex-deck.sh", "Start Codex Deck.command"]) {
@@ -86,7 +75,7 @@ async function copyPublicDocs(destination) {
   }
   await mkdir(resolve(destination, "docs/assets"), { recursive: true });
   for (const filename of [
-    "codex-deck-hero.png",
+    "codex-deck-hero.jpg",
     "agent-status-preview.svg",
     "agent-status-preview-dark.svg",
     "usage-controls-preview.svg",

@@ -208,6 +208,12 @@ npm run audit:release
 
 Команда `npm run release:prepare -- --version X.Y.Z` создаёт локальную папку кандидата в выпуск с пакетом плагина, ZIP запускаторов и контрольными суммами SHA-256. На macOS оба архива запускаторов собираются автоматически. На другой платформе сначала создайте ZIP для macOS на компьютере Mac с помощью `scripts/package-macos-release.sh`, чтобы сохранить исполняемые биты, а затем передайте его через `--mac-archive /path/to/archive.zip`.
 
+JavaScript выпускного плагина уплотнён без переименования идентификаторов; для диагностики сохраните столбец из стека ошибки. Пакет выпуска сохраняет `bin/plugin.mjs.map` без встроенного текста исходников; `npm run build` сохраняет полную карту разработки. Для диагностики нужны карта из проблемного пакета и исходники точно того коммита, из которого он собран: нужный файл можно получить командой `git show COMMIT:src/path.ts`. Строку и столбец из стека ошибки (нумерация с 1) можно сопоставить через Node 24:
+
+```sh
+node --input-type=module -e "import { readFileSync } from 'node:fs'; import { SourceMap } from 'node:module'; const [map, line, column] = process.argv.slice(1); const entry = new SourceMap(JSON.parse(readFileSync(map, 'utf8'))).findEntry(Number(line) - 1, Number(column) - 1); console.log(entry.originalSource, entry.originalLine + 1, entry.originalColumn + 1);" bin/plugin.mjs.map LINE COLUMN
+```
+
 Для исправления Stream Deck с четырёхкомпонентной версией задайте `CODEX_DECK_RELEASE_VERSION=X.Y.Z.W` при запуске упаковщика macOS и передайте `--version X.Y.Z.W` команде `npm run release:prepare`. Пакет npm сохранит форму предварительного выпуска, совместимую с SemVer.
 
 Ничего не публикуется автоматически. См. [CONTRIBUTING.md](CONTRIBUTING.md).

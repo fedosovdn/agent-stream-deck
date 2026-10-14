@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { build } from "esbuild";
+// @ts-expect-error Build options are shared with plain ESM release scripts.
+import { buildOptions } from "../scripts/build-options.mjs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,11 +90,7 @@ test("macOS discovery reuses only stable metadata while checking fresh candidate
         resolveDir: fileURLToPath(new URL("..", import.meta.url)),
       },
       outfile: runtime,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node24",
-      banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+      ...buildOptions("macos", true),
     });
     const scenario = join(root, "scenario.mjs");
     await writeFile(
@@ -258,11 +256,7 @@ test("macOS watcher update fails before stopping on preflight failure and report
     await build({
       entryPoints: [fileURLToPath(new URL("../launcher/macos/codex-deck-macos.ts", import.meta.url))],
       outfile: fixtureRuntime,
-      bundle: true,
-      platform: "node",
-      format: "esm",
-      target: "node24",
-      banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+      ...buildOptions("macos", true),
     });
     const mockPath = join(root, "mock.mjs");
     const callsPath = join(root, "calls.json");

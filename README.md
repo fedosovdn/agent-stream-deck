@@ -211,6 +211,12 @@ npm run audit:release
 
 `npm run release:prepare -- --version X.Y.Z` creates a versioned local release-candidate directory with the plugin package, launcher ZIPs, and SHA-256 checksums. On macOS it builds both launcher archives automatically. On another platform, create the macOS ZIP on a Mac with `scripts/package-macos-release.sh` so executable bits survive, then pass it with `--mac-archive /path/to/archive.zip`.
 
+The release plugin's JavaScript is compacted without renaming identifiers; keep the stack frame's column for diagnostics. Release packages keep `bin/plugin.mjs.map` without embedded source text; `npm run build` keeps a full development map. For diagnostics, use the map from the affected package and source files from the exact commit used to build it, obtainable with `git show COMMIT:src/path.ts`. Map a stack frame's line and column (both start at 1) with Node 24:
+
+```sh
+node --input-type=module -e "import { readFileSync } from 'node:fs'; import { SourceMap } from 'node:module'; const [map, line, column] = process.argv.slice(1); const entry = new SourceMap(JSON.parse(readFileSync(map, 'utf8'))).findEntry(Number(line) - 1, Number(column) - 1); console.log(entry.originalSource, entry.originalLine + 1, entry.originalColumn + 1);" bin/plugin.mjs.map LINE COLUMN
+```
+
 For a four-component Stream Deck hotfix version, set
 `CODEX_DECK_RELEASE_VERSION=X.Y.Z.W` while running the macOS packager and pass
 `--version X.Y.Z.W` to `npm run release:prepare`. The npm package keeps its

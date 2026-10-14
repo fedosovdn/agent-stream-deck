@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { build } from "esbuild";
+// @ts-expect-error Build options are shared with plain ESM release scripts.
+import { buildOptions } from "../scripts/build-options.mjs";
 import test from "node:test";
 import { createContext, runInContext, runInNewContext, type Context } from "node:vm";
 import {
@@ -775,9 +781,9 @@ test("standalone composer keycaps insert their registry text through the host me
   ]);
 });
 
-async function captureSnapshotExpression(): Promise<string> {
+async function captureSnapshotExpression(Bridge = CodexMicroRendererBridge): Promise<string> {
   let expression = "";
-  const bridge = new CodexMicroRendererBridge(() => {});
+  const bridge = new Bridge(() => {});
   const internal = bridge as unknown as {
     ensureConnected: () => Promise<void>;
     evaluate: (expression: string) => Promise<MicroSnapshot>;
@@ -945,8 +951,18 @@ test("renderer snapshot falls back to store setting readers bound to the Codex s
   assert.equal(snapshot.lightingAutoOff, "never");
 });
 
-test("renderer snapshot uses live pinned rows, caches collapsed pins and ignores hidden composers", async () => {
-  const expression = await captureSnapshotExpression();
+test("bundled renderer snapshot uses live pinned rows, caches collapsed pins and ignores hidden composers", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-pinned-bundle-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const outfile = join(directory, "bridge.mjs");
+  await build({
+    entryPoints: [fileURLToPath(new URL("../src/codex/bridge.ts", import.meta.url))],
+    outfile,
+    ...buildOptions("plugin", true),
+  });
+  const { CodexMicroRendererBridge: BundledBridge } = await import(pathToFileURL(outfile).href);
+  // The serialized sidebar function must execute without helpers from its Node bundle.
+  const expression = await captureSnapshotExpression(BundledBridge);
 
   const nativeSlots = Array.from({ length: 6 }, (_, id) => ({
     id,
