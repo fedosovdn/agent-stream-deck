@@ -161,6 +161,12 @@ function basicRoutes(now = 1_000_000): Record<string, RouteEntry> {
   };
 }
 
+// start now establishes readiness; explicit refresh is the complete-snapshot boundary for these existing assertions.
+async function startAndRefresh(collector: OpenCodeCollector) {
+  await collector.start();
+  return collector.refresh();
+}
+
 test("shares pending ancestor reads only within one connection refresh and retries changed or failed data", async () => {
   const now = 1_000_000;
   let title = "First root";
@@ -192,7 +198,7 @@ test("shares pending ancestor reads only within one connection refresh and retri
   const parentReads = () =>
     setup.requests.filter((request) => new URL(request.url).pathname === "/api/session/ses_parent");
   try {
-    const first = await collector.start();
+    const first = await startAndRefresh(collector);
     assert.deepEqual(
       first.connections.map((connection) => [connection.health, connection.tasks[0]?.displayTitle]),
       [
@@ -261,7 +267,7 @@ test("shared ancestor reads retain cycle, depth and session capacity guards", as
     const setup = fixture({ files: { [`${STATE}/service.json`]: { body: localRegistration() } }, routes });
     const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
     try {
-      const snapshot = await collector.start();
+      const snapshot = await startAndRefresh(collector);
       assert.equal(snapshot.connections[0]!.health, kind === "cycle" ? "unavailable" : "capacity-exceeded", kind);
       assert.equal(snapshot.connections[0]!.complete, false, kind);
       assert.deepEqual(
@@ -294,7 +300,7 @@ test("discovers a descriptor-approved local registration without publishing its 
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections.length, 1);
@@ -322,7 +328,7 @@ test("prefers api info and reuses its authenticated identity route across polls"
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.refresh();
   await collector.stop();
 
@@ -347,7 +353,7 @@ test("falls back to legacy api status and reuses it across polls", async () => {
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.refresh();
   await collector.stop();
 
@@ -373,7 +379,7 @@ test("reprobes the authentication boundary when a local registration changes", a
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  await collector.start();
+  await startAndRefresh(collector);
   registration.pid = 43;
   identityPid = 43;
   await collector.refresh();
@@ -396,7 +402,7 @@ test("rejects unsafe, non-loopback, broad, and incompatible registrations before
   const setup = fixture({ files, routes: basicRoutes() });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.deepEqual(snapshot.connections, []);
@@ -413,7 +419,7 @@ test("accepts a future service version when the authenticated API capabilities s
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections[0]!.health, "ready");
@@ -429,7 +435,7 @@ test("rejects a stale registration when the authenticated service identity does 
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections[0]!.health, "incompatible");
@@ -442,7 +448,7 @@ test("does not send a local service credential before the authentication boundar
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections[0]!.health, "incompatible");
@@ -483,7 +489,7 @@ test("projects only sanitized roots with attention precedence and mixed active a
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
   const tasks = snapshot.connections[0]!.tasks;
 
@@ -538,7 +544,7 @@ test("bounds and sanitizes titles before local rendering", async () => {
   const setup = fixture({ files: { [`${STATE}/service.json`]: { body: localRegistration() } }, routes });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
   const title = snapshot.connections[0]!.tasks[0]!.displayTitle;
 
@@ -567,7 +573,7 @@ test("expires successful and failed terminal outcomes five minutes after their e
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   now += 1;
   const later = await collector.refresh();
   await collector.stop();
@@ -596,7 +602,7 @@ test("acknowledges only the current terminal result and shows a later completion
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   const task = first.connections[0]!.tasks[0]!;
   assert.equal(collector.acknowledgeTask(task.connectionId, task.sessionId, task.terminalAt!), true);
   assert.deepEqual(collector.snapshot().connections[0]!.tasks, []);
@@ -640,7 +646,7 @@ test("publishes the acknowledged terminal revision through the official session 
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   const task = first.connections[0]!.tasks[0]!;
   assert.equal(collector.acknowledgeTask(task.connectionId, task.sessionId, task.terminalAt!), true);
   assert.equal(await collector.publishTaskViewed(task.connectionId, task.sessionId), true);
@@ -666,7 +672,7 @@ test("keeps the local acknowledgement when the session view route is unavailable
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   const task = first.connections[0]!.tasks[0]!;
   assert.equal(collector.acknowledgeTask(task.connectionId, task.sessionId, task.terminalAt!), true);
   assert.equal(await collector.publishTaskViewed(task.connectionId, task.sessionId), false);
@@ -695,7 +701,7 @@ test("does not publish a synthetic view revision when OpenCode omits the idle ti
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   const task = first.connections[0]!.tasks[0]!;
   assert.equal(collector.acknowledgeTask(task.connectionId, task.sessionId, task.terminalAt!), true);
   assert.equal(await collector.publishTaskViewed(task.connectionId, task.sessionId), false);
@@ -724,7 +730,7 @@ test("does not acknowledge a newer terminal revision through a stale displayed a
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   const displayed = first.connections[0]!.tasks[0]!;
   idle += 500;
   const refreshed = await collector.refresh();
@@ -755,7 +761,7 @@ test("keeps a healthy connection visible when another connection fails", async (
   const setup = fixture({ files, routes });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections.length, 2);
@@ -779,7 +785,7 @@ test("marks a bounded root page incomplete when OpenCode reports more history", 
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections[0]!.complete, false);
@@ -807,7 +813,7 @@ test("keeps a content-free task alias stable across a missed refresh", async () 
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const first = await collector.start();
+  const first = await startAndRefresh(collector);
   visible = false;
   await collector.refresh();
   visible = true;
@@ -861,7 +867,7 @@ test("discovers a CLI-managed SSH service through bounded pair output", async ()
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(snapshot.connections[0]!.health, "ready");
@@ -906,7 +912,7 @@ test("stop tears down every SSH process group", async () => {
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  const snapshot = await collector.start();
+  const snapshot = await startAndRefresh(collector);
   await collector.stop();
 
   assert.equal(tunnelKilled, true);
@@ -959,7 +965,7 @@ test("SSH identity replacement evicts its tunnel and rediscovers without interru
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
   try {
-    assert.ok((await collector.start()).connections.every((item) => item.health === "ready"));
+    assert.ok((await startAndRefresh(collector)).connections.every((item) => item.health === "ready"));
     pid = 78;
     const incompatible = await collector.refresh();
     assert.deepEqual(incompatible.connections.map((item) => item.health).sort(), ["incompatible", "ready"]);
@@ -999,7 +1005,7 @@ test("authoritative SSH settings replace changed targets and remove only their o
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
   try {
-    await collector.start();
+    await startAndRefresh(collector);
     files[SETTINGS]!.safe = false;
     await collector.refresh();
     assert.deepEqual(setup.terminated, [], "unreadable settings cannot prove removal");
@@ -1025,7 +1031,7 @@ test("authoritative SSH settings replace changed targets and remove only their o
   }
 });
 
-test("stop discards a late authenticated snapshot and never starts its polling interval", async () => {
+test("stop discards a late authenticated snapshot and clears the readiness polling interval", async () => {
   let arrived!: () => void;
   const arrival = new Promise<void>((resolve) => {
     arrived = resolve;
@@ -1049,7 +1055,7 @@ test("stop discards a late authenticated snapshot and never starts its polling i
   finish();
   await Promise.all([started, stopped]);
   assert.deepEqual(collector.snapshot(), { version: 1, observedAt: 0, connections: [] });
-  assert.deepEqual(setup.intervals, []);
+  assert.deepEqual(setup.intervals, [5_000]);
 });
 
 test("reaps orphaned tunnels once, using the exact command line the collector spawns", async () => {
@@ -1065,7 +1071,7 @@ test("reaps orphaned tunnels once, using the exact command line the collector sp
   });
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  await collector.start();
+  await startAndRefresh(collector);
   await collector.refresh();
   await collector.stop();
 
@@ -1134,7 +1140,7 @@ test("orphan reaping is retried after a failed process listing and skipped witho
   };
   const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
 
-  await collector.start();
+  await startAndRefresh(collector);
   await collector.refresh();
   await collector.refresh();
   await collector.stop();
@@ -1142,7 +1148,594 @@ test("orphan reaping is retried after a failed process listing and skipped witho
 
   const empty = fixture({ files: { [SETTINGS]: { body: { "ssh.servers": [] } } }, routes: basicRoutes() });
   const idle = new OpenCodeCollector({ identitySecret: SECRET, dependencies: empty.dependencies });
-  await idle.start();
+  await startAndRefresh(idle);
   await idle.stop();
   assert.deepEqual(empty.reaped, []);
+});
+
+test("publishes three local cycles while SSH discovery remains held", async () => {
+  let release!: () => void;
+  const held = new Promise<number>((resolve) => {
+    release = () => resolve(0);
+  });
+  let spawned!: () => void;
+  const arrival = new Promise<void>((resolve) => {
+    spawned = resolve;
+  });
+  const processes = sshProcesses(9001, 9002);
+  processes[0]!.exited = held;
+  const routes = basicRoutes();
+  let title = "Local 1";
+  routes["/api/session/active"] = response({ data: { ses_local: { type: "running" } } });
+  routes["/api/session?parentID=null&order=desc&limit=100"] = () =>
+    response({ data: [session("ses_local", 999_900, { title })], cursor: {} });
+  routes["127.0.0.1:43123/api/info"] = ({ authorization }) =>
+    authorization ? response({ version: "2.0.5", pid: 77 }) : response({}, 401);
+  const setup = fixture({
+    files: {
+      [`${STATE}/service.json`]: { body: localRegistration() },
+      [SETTINGS]: { body: { "ssh.servers": [{ id: "saved", target: "fixture-host", name: "Fixture" }] } },
+    },
+    routes,
+    processes,
+  });
+  const spawn = setup.dependencies.spawn;
+  setup.dependencies.spawn = async (...args) => {
+    const child = await spawn(...args);
+    spawned();
+    return child;
+  };
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  const started = collector.start();
+  try {
+    await arrival;
+    await yieldIO();
+    assert.equal(collector.snapshot().connections.flatMap((item) => item.tasks)[0]?.displayTitle, "Local 1");
+    for (const next of ["Local 2", "Local 3"]) {
+      title = next;
+      void collector.refresh();
+      await yieldIO();
+      assert.equal(
+        collector
+          .snapshot()
+          .connections.flatMap((item) => item.tasks)
+          .find((task) => task.sessionId === "ses_local")?.displayTitle,
+        next,
+      );
+    }
+  } finally {
+    release();
+    await started;
+    await collector.stop();
+  }
+});
+
+test("own polling publishes local changes through three bounded remote stages", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const gate = () => {
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { promise, release };
+  };
+  const discovery = gate();
+  const identity = gate();
+  const collection = gate();
+  const processes = sshProcesses(9101, 9102);
+  processes[0]!.exited = discovery.promise.then(() => 0);
+  let title = "Cycle 1";
+  let now = 1_000_000;
+  const stages: string[] = [];
+  const routes = basicRoutes();
+  routes["/api/session/active"] = response({ data: { ses_local: { type: "running" } } });
+  routes["/api/session?parentID=null&order=desc&limit=100"] = () =>
+    response({ data: [session("ses_local", 999_900, { title })], cursor: {} });
+  routes["127.0.0.1:43123/api/info"] = async ({ authorization }) => {
+    if (!authorization) return response({}, 401);
+    stages.push("identity");
+    await identity.promise;
+    return response({ version: "2.0.5", pid: 77 });
+  };
+  routes["127.0.0.1:43123/api/session/active"] = async () => {
+    stages.push("collection");
+    await collection.promise;
+    return response({ data: {} });
+  };
+  const setup = fixture({
+    now: () => now,
+    routes,
+    processes,
+    files: {
+      [`${STATE}/service.json`]: { body: localRegistration() },
+      [SETTINGS]: { body: { "ssh.servers": [{ id: "saved", target: "fixture-host", name: "Fixture" }] } },
+    },
+  });
+  setup.dependencies.setInterval = setInterval;
+  setup.dependencies.clearInterval = clearInterval;
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  const published: string[] = [];
+  const unsubscribe = collector.subscribe(() => {
+    const task = collector
+      .snapshot()
+      .connections.flatMap((item) => item.tasks)
+      .find((task) => task.sessionId === "ses_local");
+    if (task?.displayTitle) published.push(task.displayTitle);
+  });
+  try {
+    assert.deepEqual(await collector.start(), { version: 1, observedAt: 0, connections: [] });
+    await yieldIO();
+    assert.equal(published.at(-1), "Cycle 1");
+    now += 4_500;
+    context.mock.timers.tick(4_500);
+    discovery.release();
+    await yieldIO();
+    assert.deepEqual(stages, ["identity"]);
+    title = "Cycle 2";
+    now += 500;
+    context.mock.timers.tick(500);
+    await yieldIO();
+    assert.equal(published.at(-1), "Cycle 2");
+    now += 4_000;
+    context.mock.timers.tick(4_000);
+    identity.release();
+    await yieldIO();
+    assert.deepEqual(stages, ["identity", "identity", "collection"]);
+    title = "Cycle 3";
+    now += 1_000;
+    context.mock.timers.tick(1_000);
+    await yieldIO();
+    assert.equal(published.at(-1), "Cycle 3");
+    now += 3_500;
+    context.mock.timers.tick(3_500);
+    collection.release();
+    await yieldIO();
+    assert.ok(collector.snapshot().connections.every((item) => item.health === "ready"));
+  } finally {
+    discovery.release();
+    identity.release();
+    collection.release();
+    unsubscribe();
+    await collector.stop();
+  }
+});
+
+test("acknowledgement made during a collection remains authoritative at commit", async () => {
+  const routes = basicRoutes();
+  let revision = 999_900;
+  let release!: () => void;
+  let arrived!: () => void;
+  const arrival = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let delay = false;
+  routes["/api/session?parentID=null&order=desc&limit=100"] = async () => {
+    const result = response({
+      data: [session("ses_ack", revision, { outcome: "succeeded", idle: revision })],
+      cursor: {},
+    });
+    if (delay) {
+      arrived();
+      await held;
+    }
+    return result;
+  };
+  const setup = fixture({ routes, files: { [`${STATE}/service.json`]: { body: localRegistration() } } });
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    const first = await startAndRefresh(collector);
+    const task = first.connections[0]!.tasks[0]!;
+    delay = true;
+    const pending = collector.refresh();
+    await arrival;
+    assert.equal(collector.acknowledgeTask(task.connectionId, task.sessionId, task.terminalAt!), true);
+    release();
+    assert.deepEqual((await pending).connections[0]!.tasks, []);
+    revision = 999_950;
+    delay = false;
+    assert.equal((await collector.refresh()).connections[0]!.tasks[0]?.terminalAt, 999_950);
+  } finally {
+    release();
+    await collector.stop();
+  }
+});
+
+test("replacement registration commits before the old request returns and rejects that old result", async () => {
+  const routes = basicRoutes();
+  let release!: () => void;
+  let arrived!: () => void;
+  const arrival = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const files = { [`${STATE}/service.json`]: { body: localRegistration() } };
+  routes["127.0.0.1:4096/api/session/active"] = async () => {
+    arrived();
+    await held;
+    return response({ data: { ses_old: { type: "running" } } });
+  };
+  routes["/api/session/active"] = response({ data: { ses_new: { type: "running" } } });
+  routes["/api/session?parentID=null&order=desc&limit=100"] = response({
+    data: [session("ses_new", 999_900), session("ses_old", 999_900)],
+    cursor: {},
+  });
+  const setup = fixture({ routes, files });
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    await collector.start();
+    await arrival;
+    files[`${STATE}/service.json`]!.body = localRegistration({ url: "http://127.0.0.1:4097", password: "replacement" });
+    const replaced = await collector.refresh();
+    assert.deepEqual(
+      replaced.connections[0]!.tasks.map((task) => task.sessionId),
+      ["ses_new"],
+    );
+    release();
+    await yieldIO();
+    assert.deepEqual(
+      collector.snapshot().connections[0]!.tasks.map((task) => task.sessionId),
+      ["ses_new"],
+    );
+  } finally {
+    release();
+    await collector.stop();
+  }
+});
+
+function remoteFixture(files: Record<string, FileEntry>, routes: Record<string, RouteEntry>) {
+  const setup = fixture({ files, routes });
+  let port = 4_400;
+  let pid = 10_000;
+  setup.dependencies.reserveLoopbackPort = async () => port++;
+  setup.dependencies.spawn = async (_command, args) => {
+    const processes = sshProcesses(pid++, pid++);
+    if (args.includes("unreachable") && !args.includes("-N")) processes[0]!.exited = Promise.resolve(1);
+    return processes[args.includes("-N") ? 1 : 0]!;
+  };
+  routes["/api/info"] = ({ authorization, url }) =>
+    authorization
+      ? response({ version: "2.0.5", pid: Number(new URL(url).port) >= 4_400 ? 77 : 42 })
+      : response({}, 401);
+  return setup;
+}
+
+test("admits seventeen sorted locals and retains SSH diagnostics beyond the connection slice", async () => {
+  const files: Record<string, FileEntry> = {};
+  for (let index = 0; index < 18; index++) {
+    files[`${STATE}/service.${String(index).padStart(2, "0")}.json`] = {
+      body: localRegistration({ id: `local-${index}`, url: `http://127.0.0.1:${4_096 + index}` }),
+    };
+  }
+  files[SETTINGS] = {
+    body: {
+      "ssh.servers": [
+        { id: "saved", target: "fixture-host", name: "Fixture" },
+        { id: "failed", target: "unreachable", name: "Unavailable" },
+      ],
+    },
+  };
+  const routes = basicRoutes();
+  const setup = remoteFixture(files, routes);
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    const snapshot = await startAndRefresh(collector);
+    assert.equal(snapshot.connections.filter((item) => item.health === "ready").length, 17);
+    assert.equal(snapshot.connections.filter((item) => item.health === "unavailable").length, 1);
+    assert.equal(snapshot.connections.length, 18);
+    assert.deepEqual(
+      setup.requests
+        .filter((request) => new URL(request.url).pathname === "/api/session/active")
+        .map((request) => Number(new URL(request.url).port))
+        .sort((a, b) => a - b),
+      [4096, 4097, 4098, 4099, 4100, 4101, 4102, 4103, 4104, 4105, 4106, 4107, 4108, 4109, 4110, 4111, 4112],
+    );
+  } finally {
+    await collector.stop();
+  }
+});
+
+test("three borrowed remote slots yield one local reserve while the other slots retain FIFO", async () => {
+  const files: Record<string, FileEntry> = {
+    [SETTINGS]: {
+      body: {
+        "ssh.servers": [0, 1, 2, 3].map((index) => ({
+          id: `remote-${index}`,
+          target: `fixture-${index}`,
+          name: "Fixture",
+        })),
+      },
+    },
+  };
+  const routes = basicRoutes();
+  const events: number[] = [];
+  const releases = new Map<number, () => void>();
+  let active = 0;
+  let maximum = 0;
+  let free = false;
+  routes["/api/session/active"] = async ({ url }) => {
+    const port = Number(new URL(url).port);
+    events.push(port);
+    active++;
+    maximum = Math.max(maximum, active);
+    if (!free)
+      await new Promise<void>((resolve) => {
+        releases.set(port, resolve);
+      });
+    active--;
+    return response({ data: {} });
+  };
+  const setup = remoteFixture(files, routes);
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  const release = async (port: number) => {
+    releases.get(port)!();
+    releases.delete(port);
+    await yieldIO();
+  };
+  try {
+    await collector.start();
+    await yieldIO();
+    assert.deepEqual(events, [4400, 4401, 4402], "all three slots are available to remote work without local demand");
+    for (let index = 0; index < 13; index++)
+      files[`${STATE}/service.${index}.json`] = {
+        body: localRegistration({ id: `local-${index}`, url: `http://127.0.0.1:${4096 + index}` }),
+      };
+    const pending = collector.refresh();
+    void collector.refresh();
+    void collector.refresh();
+    await yieldIO();
+    assert.deepEqual(events, [4400, 4401, 4402], "local demand does not preempt the three running remote collections");
+    await release(4400);
+    assert.equal(events[3], 4096, "the first free slot supplies the conditional local reserve");
+    await release(4401);
+    assert.equal(events[4], 4403, "the second free slot takes the remote work already waiting in FIFO");
+    await release(4096);
+    assert.equal(events[5], 4097, "multiple local waiters progress through the single reserve");
+    assert.equal(maximum, 3);
+    assert.equal(setup.terminated.length, 0, "admission never kills borrowed remote work");
+    free = true;
+    for (const finish of releases.values()) finish();
+    releases.clear();
+    await pending;
+    assert.equal(collector.snapshot().connections.length, 17);
+    assert.equal(new Set(events).size, 17);
+    assert.equal(events.length, 17, "repeated pending refreshes do not accumulate duplicate collection work");
+    assert.equal(maximum, 3);
+  } finally {
+    free = true;
+    for (const finish of releases.values()) finish();
+    await collector.stop();
+  }
+});
+
+test("late SSH children and the old stop cannot affect a restarted generation", async () => {
+  const routes = basicRoutes();
+  const files: Record<string, FileEntry> = {
+    [`${STATE}/service.json`]: { body: localRegistration() },
+    [SETTINGS]: {
+      body: {
+        "ssh.servers": [0, 1].map((index) => ({ id: `saved-${index}`, target: `old-${index}`, name: "Fixture" })),
+      },
+    },
+  };
+  const setup = remoteFixture(files, routes);
+  const spawn = setup.dependencies.spawn;
+  const late: Array<{ release(): void; child: OpenCodeProcess }> = [];
+  setup.dependencies.spawn = async (...args) => {
+    const child = await spawn(...args);
+    if (args[1].some((argument) => /^old-/u.test(argument))) {
+      await new Promise<void>((resolve) => {
+        late.push({ release: resolve, child });
+      });
+    }
+    return child;
+  };
+  const timers = new Set<NodeJS.Timeout>();
+  setup.dependencies.setInterval = () => {
+    const timer = {} as NodeJS.Timeout;
+    timers.add(timer);
+    return timer;
+  };
+  setup.dependencies.clearInterval = (timer) => {
+    timers.delete(timer);
+  };
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    await collector.start();
+    await yieldIO();
+    assert.equal(late.length, 2, "the global SSH discovery limit is two");
+    const stopped = collector.stop();
+    files[SETTINGS] = { body: { "ssh.servers": [{ id: "saved-0", target: "new-target", name: "Fixture" }] } };
+    await collector.start();
+    const current = collector.refresh();
+    await yieldIO();
+    assert.equal(late.length, 2, "old executing discoveries retain their capacity until they finish");
+    assert.equal(
+      collector.snapshot().connections[0]?.health,
+      "ready",
+      "local collection progresses in the new generation",
+    );
+    for (const item of late) item.release();
+    await Promise.all([stopped, current]);
+    assert.equal(timers.size, 1, "the old stop does not clear the new generation's timer");
+    assert.ok(
+      late.every((item) => setup.terminated.includes(item.child.pid)),
+      "late old children are reaped",
+    );
+    assert.equal(collector.snapshot().connections.length, 2);
+    assert.ok(collector.snapshot().connections.every((item) => item.health === "ready"));
+  } finally {
+    for (const item of late) item.release();
+    await collector.stop();
+    assert.equal(timers.size, 0);
+  }
+});
+
+test("sixteen local waiters share one reserve and cannot requeue ahead of a waiting remote", async () => {
+  const files: Record<string, FileEntry> = {
+    [SETTINGS]: { body: { "ssh.servers": [{ id: "saved", target: "fixture-host", name: "Fixture" }] } },
+  };
+  for (let index = 0; index < 16; index++)
+    files[`${STATE}/service.${String(index).padStart(2, "0")}.json`] = {
+      body: localRegistration({ id: `local-${index}`, url: `http://127.0.0.1:${4096 + index}` }),
+    };
+  const routes = basicRoutes();
+  const events: number[] = [];
+  const releases = new Map<number, () => void>();
+  let free = false;
+  routes["/api/session/active"] = async ({ url }) => {
+    const port = Number(new URL(url).port);
+    events.push(port);
+    if (!free)
+      await new Promise<void>((resolve) => {
+        releases.set(port, resolve);
+      });
+    return response({ data: {} });
+  };
+  const setup = remoteFixture(files, routes);
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    await collector.start();
+    await yieldIO();
+    assert.deepEqual(events, [4096, 4097, 4098]);
+    releases.get(4097)!();
+    releases.delete(4097);
+    await yieldIO();
+    assert.equal(events.at(-1), 4099);
+    // The completed local joins behind the remote, while its neighbours still wait.
+    const requeued = collector.refresh();
+    await yieldIO();
+    for (let index = 3; index < 16; index++) {
+      const port = 4096 + index;
+      releases.get(port)!();
+      releases.delete(port);
+      await yieldIO();
+    }
+    assert.equal(events.at(-1), 4400, "FIFO reaches the remote before the completed local re-enters");
+    assert.equal(events.filter((port) => port === 4097).length, 1);
+    free = true;
+    for (const finish of releases.values()) finish();
+    releases.clear();
+    await requeued;
+    assert.equal(events.filter((port) => port === 4097).length, 2);
+    assert.equal(collector.snapshot().connections.length, 17);
+  } finally {
+    free = true;
+    for (const finish of releases.values()) finish();
+    await collector.stop();
+  }
+});
+
+test("a pending environment retains its timestamp and a successful empty result clears only itself", async () => {
+  const routes = basicRoutes();
+  routes["/api/session/active"] = response({ data: { ses_work: { type: "running" } } });
+  routes["/api/session?parentID=null&order=desc&limit=100"] = response({
+    data: [session("ses_work", 999_900)],
+    cursor: {},
+  });
+  let now = 1_000_000;
+  const setup = fixture({
+    now: () => now,
+    routes,
+    files: {
+      [`${STATE}/service.one.json`]: { body: localRegistration({ id: "one" }) },
+      [`${STATE}/service.two.json`]: { body: localRegistration({ id: "two", url: "http://127.0.0.1:4097" }) },
+    },
+  });
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    await startAndRefresh(collector);
+    const previous = collector.snapshot().connections;
+    const updates: Array<[number, number[]]> = [];
+    const unsubscribe = collector.subscribe(() => {
+      const snapshot = collector.snapshot();
+      updates.push([
+        snapshot.connections.flatMap((item) => item.tasks).length,
+        snapshot.connections.map((item) => item.observedAt).sort(),
+      ]);
+    });
+    routes["127.0.0.1:4097/api/session/active"] = async () => {
+      await held;
+      return response({ data: {} });
+    };
+    routes["127.0.0.1:4097/api/session?parentID=null&order=desc&limit=100"] = response({ data: [], cursor: {} });
+    now = 1_005_000;
+    const pending = collector.refresh();
+    await yieldIO();
+    assert.equal(collector.snapshot().connections.flatMap((item) => item.tasks).length, 2);
+    assert.deepEqual(
+      collector
+        .snapshot()
+        .connections.map((item) => item.observedAt)
+        .sort(),
+      [1_000_000, 1_005_000],
+    );
+    assert.ok(
+      previous.every((item) => item.observedAt === 1_000_000),
+      "previous whole snapshots remain immutable",
+    );
+    release();
+    const finished = await pending;
+    assert.equal(finished.connections.flatMap((item) => item.tasks).length, 1);
+    assert.ok(finished.connections.every((item) => item.health === "ready"));
+    assert.deepEqual(updates, [
+      [2, [1_000_000, 1_005_000]],
+      [1, [1_005_000, 1_005_000]],
+    ]);
+    unsubscribe();
+    await collector.refresh();
+    assert.equal(updates.length, 2, "unsubscribe stops further committed-snapshot notifications");
+  } finally {
+    release();
+    await collector.stop();
+  }
+});
+
+test("stop waits for owned tunnel termination after child registry cleanup", async () => {
+  const routes = basicRoutes();
+  const setup = remoteFixture(
+    { [SETTINGS]: { body: { "ssh.servers": [{ id: "saved", target: "fixture-host", name: "Fixture" }] } } },
+    routes,
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let terminating!: () => void;
+  const arrival = new Promise<void>((resolve) => {
+    terminating = resolve;
+  });
+  setup.dependencies.terminateProcessGroup = async () => {
+    terminating();
+    await held;
+  };
+  const collector = new OpenCodeCollector({ identitySecret: SECRET, dependencies: setup.dependencies });
+  try {
+    await startAndRefresh(collector);
+    let stopped = false;
+    const pending = collector.stop().then(() => {
+      stopped = true;
+    });
+    await arrival;
+    await yieldIO();
+    assert.equal(
+      stopped,
+      false,
+      "stop owns the in-progress teardown even after the child is detached from its registry",
+    );
+    release();
+    await pending;
+    assert.equal(stopped, true);
+  } finally {
+    release();
+    await collector.stop();
+  }
 });

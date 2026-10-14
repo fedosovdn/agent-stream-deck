@@ -8,11 +8,11 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import streamDeck, { type KeyAction, type TitleParametersDidChangeEvent } from "@elgato/streamdeck";
-import type { HostHealth, HostSnapshot, TaskSource } from "#agents";
+import type { HostHealth, HostSnapshot, RoutedAgentSlot, TaskSource } from "#agents";
 import { CodexMicroRendererBridge, type CodexSource } from "#codex";
-import { type OpenCodeCollector, type OpenCodeCollectorSnapshot, OpenCodeSource, type OpenCodeTask } from "#opencode";
+import { OpenCodeCollector, type OpenCodeCollectorSnapshot, OpenCodeSource, type OpenCodeTask } from "#opencode";
 import { Agent1, type AgentDisplaySettings, DeckController, RateLimitReset, ReasoningUp } from "#stream-deck";
-import { T3CodeSource } from "#t3code";
+import type { T3CodeSource } from "#t3code";
 import { CODEX_BAR_FRESH_MS } from "#usage";
 import { codexDeckStateRoot } from "../src/runtime/paths.js";
 import { createMicroSnapshot, host } from "./support/micro-snapshot.js";
@@ -76,16 +76,40 @@ class OfflineOpenCodeSource extends OpenCodeSource {
   }
 }
 
-/** Real T3 source logic, but a refresh never reads the private configuration or contacts a server. */
-class OfflineT3CodeSource extends T3CodeSource {
-  override async refresh(): Promise<void> {}
+type T3Stub = Pick<T3CodeSource, "slots" | "health" | "syncDemand" | "refresh" | "stop" | "open" | "subscribe"> & {
+  opens: RoutedAgentSlot[];
+};
+
+/** The controller receives a source acknowledgement; T3 environment and revision rules have their own owner tests. */
+function createT3Stub(foreground: () => Promise<void> = async () => {}): T3Stub {
+  const listeners = new Set<() => void>();
+  const stub: T3Stub = {
+    slots: [],
+    health: { state: "connecting", reason: "awaiting-snapshot", changedAt: 1 },
+    opens: [],
+    syncDemand() {},
+    async refresh() {},
+    stop() {},
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    async open(assignment) {
+      stub.opens.push(assignment);
+      await foreground();
+      stub.slots = [];
+      for (const listener of listeners) listener();
+      return true;
+    },
+  };
+  return stub;
 }
 
 type Deck = {
   controller: DeckController;
   codex: CodexStub;
   openCode: OfflineOpenCodeSource;
-  t3Code: OfflineT3CodeSource;
+  t3Code: T3Stub;
 };
 
 function createDeck(
@@ -93,8 +117,12 @@ function createDeck(
 ): Deck {
   const codex = createCodexStub();
   const openCode = new OfflineOpenCodeSource(() => {}, options.foregroundOpenCode);
-  const t3Code = new OfflineT3CodeSource(() => {}, { foreground: options.foregroundT3Code });
-  const controller = new DeckController({ codex: codex as unknown as CodexSource, openCode, t3Code });
+  const t3Code = createT3Stub(options.foregroundT3Code);
+  const controller = new DeckController({
+    codex: codex as unknown as CodexSource,
+    openCode,
+    t3Code: t3Code as unknown as T3CodeSource,
+  });
   return { controller, codex, openCode, t3Code };
 }
 
@@ -132,6 +160,7 @@ async function startDeck(
   }
   context.after(() => deck.controller.stop());
   await deck.controller.start();
+  await drain();
 }
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -157,7 +186,7 @@ async function poll(context: TestContext, deck: Deck): Promise<void> {
   const before = deck.codex.refreshes;
   context.mock.timers.tick(1_200);
   await eventually(() => assert.equal(deck.codex.refreshes, before + 1));
-  await settle();
+  await drain();
 }
 
 type FakeKey = {
@@ -712,6 +741,8 @@ test("startup and legacy host action use the local bridge while preserving old p
       } };
       try {
         await controller.start();
+        while (codex.localHealth.state !== "ready") await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
         const legacy = new HostToggle(controller);
         legacy.onWillAppear(event);
         await legacy.onKeyDown(event);
@@ -833,11 +864,13 @@ for (const [name, platform, barAge, expected] of [
     const key = fakeKey(platform);
     deck.controller.registerUsageLimit(key.action, "five-hour");
     await settle();
-    deck.controller.registerUsageOverview(key.action);
+    const overview = fakeKey(`${platform}-overview`);
+    deck.controller.registerUsageOverview(overview.action);
     await settle();
 
-    assert.equal(key.images.length, 2);
-    for (const image of key.images) {
+    const images = [...key.images, ...overview.images];
+    assert.equal(images.length, 2);
+    for (const image of images) {
       if (expected === undefined) assert.doesNotMatch(image, /data-usage-used=/);
       else assert.match(image, new RegExp(`data-usage-used="${expected}"`));
       assert.match(image, /data-theme="dark"/);
@@ -1008,13 +1041,15 @@ test("an empty Agent press queued behind a prior pair captures its no-op before 
   ]);
 });
 
-test("T3 Agent presses acknowledge the captured result and never send Codex phases", async () => {
+test("T3 Agent presses acknowledge the captured result and never send Codex phases", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 2_000 });
   let foregrounds = 0;
   const deck = createDeck({
     foregroundT3Code: async () => {
       foregrounds++;
     },
   });
+  context.after(() => deck.controller.stop());
   deck.codex.localHealth = { state: "ready", changedAt: 1 };
   deck.controller.setAgentDisplaySettings({ taskSource: "T3 Code" });
   await settle();
@@ -1028,7 +1063,7 @@ test("T3 Agent presses acknowledge the captured result and never send Codex phas
       status: "unread",
       taskSource: "t3code",
       selected: false,
-      activityAt: Date.now(),
+      activityAt: 1_000,
       observedAt: Date.now(),
     },
   ];
@@ -1047,9 +1082,13 @@ test("T3 Agent presses acknowledge the captured result and never send Codex phas
   await deck.controller.sendAgent(0, 0, { id: "t3-key" });
 
   assert.equal(foregrounds, 1);
+  assert.deepEqual(
+    deck.t3Code.opens.map(({ threadKey, activityAt, status }) => [threadKey, activityAt, status]),
+    [["thread", 1_000, "unread"]],
+    "the source receives the exact displayed terminal identity",
+  );
   assert.deepEqual(deck.t3Code.slots, []);
   assert.equal(keyLabel(key.images.at(-1)), "black", "the acknowledged result leaves the queue");
-  deck.controller.stop();
 });
 
 test("overlapping refresh triggers share one source poll, and an Agent press-down does not refresh", async (context) => {
@@ -1128,13 +1167,394 @@ function titleEvents(context: TestContext) {
   };
 }
 
-function defer() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
+function defer<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
     resolve = done;
   });
   return { promise, resolve };
 }
+
+test("slow animated SDK passes release same-key source presses before the consumer drains", async (context) => {
+  const deck = createDeck();
+  const task = (threadKey: string): RoutedAgentSlot => ({
+    id: 0,
+    sourceSlot: 0,
+    host,
+    threadKey,
+    title: threadKey,
+    status: "working",
+    taskSource: "t3code",
+    selected: false,
+    workStartedAt: 1,
+    observedAt: Date.now(),
+  });
+  const firstTask = task("First captured");
+  const nextTask = task("Next captured");
+  deck.t3Code.slots = [firstTask];
+  deck.t3Code.health = { state: "ready", changedAt: 1 };
+  deck.t3Code.open = async (assignment) => {
+    deck.t3Code.opens.push(assignment);
+    deck.t3Code.slots = [nextTask];
+    return true;
+  };
+  await startDeck(context, deck, { settings: { taskSource: "T3 Code" }, mockTimers: true });
+  const key = fakeKey("slow-animated-input");
+  const gates: ReturnType<typeof defer<void>>[] = [];
+  let active = 0;
+  let maximum = 0;
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    const gate = defer();
+    gates.push(gate);
+    maximum = Math.max(maximum, ++active);
+    await gate.promise;
+    active--;
+    key.images.push(decodeURIComponent(image));
+  });
+  context.after(() => {
+    for (const gate of gates) gate.resolve();
+  });
+  deck.controller.registerAgent(0, key.action);
+  await drain();
+  let firstDone = false;
+  let nextDone = false;
+  const first = deck.controller.sendAgent(0, 1, key.action).then(() => {
+    firstDone = true;
+  });
+  await drain();
+  const release = deck.controller.sendAgent(0, 0, key.action);
+  const next = deck.controller.sendAgent(0, 1, key.action).then(() => {
+    nextDone = true;
+  });
+  for (let pass = 0; pass < 4; pass++) {
+    context.mock.timers.tick(250);
+    gates[pass]!.resolve();
+    await drain();
+    assert.equal(gates.length, pass + 2, "a newer animated pass stays held after each slow delivery");
+  }
+  context.diagnostic(
+    JSON.stringify({ firstDone, nextDone, opens: deck.t3Code.opens.length, sdkPasses: gates.length, maximum }),
+  );
+  assert.equal(firstDone, true, "the first press waits only for its own display pass");
+  assert.equal(nextDone, true, "the next same-key press progresses while animation is still pending");
+  assert.deepEqual(
+    deck.t3Code.opens.map(({ threadKey }) => threadKey),
+    ["First captured", "Next captured"],
+  );
+  assert.equal(maximum, 1, "SDK calls stay serial");
+  assert.equal(keyLabel(key.images.at(-1)), "Next captured");
+  deck.controller.stop();
+  gates.at(-1)!.resolve();
+  await Promise.all([first, release, next]);
+});
+
+test("a later public display request succeeds after an earlier SDK pass fails", async (context) => {
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("separate-pass-errors");
+  deck.controller.registerHostToggle(key.action);
+  await drain();
+  const gate = defer();
+  let calls = 0;
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    if (++calls === 1) {
+      await gate.promise;
+      throw new Error("first SDK pass failed");
+    }
+    key.images.push(decodeURIComponent(image));
+  });
+  context.after(() => gate.resolve());
+  deck.codex.localHealth = { state: "ready", changedAt: 2 };
+  const failed = assert.rejects(deck.controller.toggleTargetHost(), /first SDK pass failed/);
+  await drain();
+  deck.codex.localHealth = { state: "offline", changedAt: 3 };
+  const later = deck.controller.toggleTargetHost();
+  const result = later.then(
+    () => "success",
+    () => "old error",
+  );
+  gate.resolve();
+  await failed;
+  const outcome = await result;
+  context.diagnostic(JSON.stringify({ outcome, sdkCalls: calls }));
+  assert.equal(outcome, "success", "successful queued delivery does not inherit an older failure");
+  assert.equal(calls, 2);
+  assert.match(key.images.at(-1)!, /data-host-health="offline"/);
+});
+
+for (const change of ["identical", "demand cancellation", "stop cancellation"] as const) {
+  test(`${change} OpenCode demand joins secret creation and uses the latest local host`, {
+    skip: process.platform === "win32" ? "OpenCode collection runs only on macOS" : false,
+  }, async (context) => {
+    await isolateHome(context);
+    const entered = defer();
+    const gate = defer();
+    const originalOpen = fsPromises.open;
+    let preparations = 0;
+    const mockedOpen = context.mock.method(fsPromises, "open", async (...args: Parameters<typeof fsPromises.open>) => {
+      const creating = typeof args[0] === "string" && args[0].endsWith("opencode-identity.key") && args[2] === 0o600;
+      if (creating) preparations++;
+      const handle = await originalOpen(...args);
+      if (creating) {
+        const originalWrite = handle.writeFile.bind(handle);
+        context.mock.method(handle, "writeFile", async (...writeArgs: Parameters<typeof handle.writeFile>) => {
+          entered.resolve();
+          await gate.promise;
+          return originalWrite(...writeArgs);
+        });
+      }
+      return handle;
+    });
+    syncBuiltinESMExports();
+    context.after(() => {
+      gate.resolve();
+      mockedOpen.mock.restore();
+      syncBuiltinESMExports();
+    });
+    const ready: OpenCodeCollectorSnapshot = {
+      version: 1,
+      observedAt: 1,
+      connections: [
+        {
+          connectionId: "local",
+          health: "ready",
+          complete: true,
+          observedAt: 1,
+          tasks: [{ source: "opencode", connectionId: "local", sessionId: "task", label: "Task", status: "working" }],
+        },
+      ],
+    };
+    let collectors = 0;
+    context.mock.method(OpenCodeCollector.prototype, "start", async () => {
+      collectors++;
+      return ready;
+    });
+    context.mock.method(OpenCodeCollector.prototype, "stop", async () => {});
+    context.mock.method(OpenCodeCollector.prototype, "snapshot", () => ready);
+    const source = new OpenCodeSource(() => {});
+    context.after(() => source.stop());
+    const first = source.syncDemand("OpenCode", host, false);
+    await entered.promise;
+    if (change === "demand cancellation") await source.syncDemand("Codex", host, false);
+    if (change === "stop cancellation") source.stop();
+    const latestHost = { ...host, hostId: "latest-local-host" };
+    const second = source.syncDemand("OpenCode", latestHost, false);
+    await drain();
+    gate.resolve();
+    await Promise.all([first, second]);
+    context.diagnostic(JSON.stringify({ preparations, collectors, health: source.openCodeHealth.state }));
+    assert.equal(preparations, 1);
+    assert.equal(collectors, 1, "only one collector is prepared for identical pending demand");
+    assert.equal(source.openCodeHealth.state, "ready");
+    assert.equal(source.openCodeSlots[0]!.host.hostId, "latest-local-host");
+  });
+}
+
+for (const cancel of ["demand", "stop"] as const) {
+  test(`OpenCode ${cancel} cancellation cannot let an old preparation clear its replacement`, {
+    skip: process.platform === "win32" ? "OpenCode collection runs only on macOS" : false,
+  }, async (context) => {
+    await isolateHome(context);
+    const entered = [defer(), defer()];
+    const gates = [defer(), defer()];
+    const ready: OpenCodeCollectorSnapshot = {
+      version: 1,
+      observedAt: 1,
+      connections: [
+        {
+          connectionId: "local",
+          health: "ready",
+          complete: true,
+          observedAt: 1,
+          tasks: [],
+        },
+      ],
+    };
+    let collectors = 0;
+    const stopped: OpenCodeCollector[] = [];
+    context.mock.method(OpenCodeCollector.prototype, "start", async () => {
+      const index = collectors++;
+      entered[index]!.resolve();
+      await gates[index]!.promise;
+      return ready;
+    });
+    context.mock.method(OpenCodeCollector.prototype, "stop", async function (this: OpenCodeCollector) {
+      stopped.push(this);
+    });
+    context.mock.method(OpenCodeCollector.prototype, "snapshot", () => ready);
+    const source = new OpenCodeSource(() => {});
+    context.after(() => {
+      source.stop();
+      for (const gate of gates) gate.resolve();
+    });
+    const first = source.syncDemand("OpenCode", host, false);
+    await entered[0]!.promise;
+    const old = source.openCodeCollector;
+    if (cancel === "stop") source.stop();
+    else await source.syncDemand("Codex", host, false);
+    const replacement = source.syncDemand("OpenCode", host, false);
+    await entered[1]!.promise;
+    const current = source.openCodeCollector;
+    assert.notEqual(current, old);
+    gates[0]!.resolve();
+    await first;
+    let joinedDone = false;
+    const joined = source.syncDemand("OpenCode", { ...host, hostId: "replacement-host" }, false).then(() => {
+      joinedDone = true;
+    });
+    await drain();
+    assert.equal(joinedDone, false, "old finally cannot clear the still-pending replacement");
+    assert.equal(source.openCodeCollector, current);
+    assert.equal(source.openCodeHealth.state, "connecting", "old result cannot publish readiness");
+    assert.ok(stopped.includes(old!));
+    assert.ok(!stopped.includes(current!));
+    gates[1]!.resolve();
+    await Promise.all([replacement, joined]);
+    assert.equal(collectors, 2);
+    assert.equal(source.openCodeHealth.state, "ready");
+  });
+}
+
+test("SDK delivery coalesces source, settings, and animation revisions while preserving a held assignment", async (context) => {
+  const deck = createDeck();
+  const input = createMicroSnapshot();
+  input.slots.forEach((slot) => {
+    slot.status = "idle";
+    slot.selected = false;
+  });
+  input.slots[0]!.status = "working";
+  deck.codex.localSnapshot = { host, snapshot: input, observedAt: Date.now() };
+  deck.codex.localHealth = { state: "ready", changedAt: 1 };
+  await startDeck(context, deck, { settings: { taskSource: "All" }, mockTimers: true });
+  const key = fakeKey("held-sdk");
+  const gate = defer();
+  const started: string[] = [];
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    started.push(decodeURIComponent(image));
+    if (started.length === 1) await gate.promise;
+    key.images.push(decodeURIComponent(image));
+  });
+  deck.controller.registerAgent(0, key.action);
+  await drain();
+  await deck.controller.sendAgent(0, 1, { id: key.action.id });
+  context.mock.timers.tick(200);
+  await drain();
+  deck.openCode.openCodeSlots = [
+    {
+      id: 0,
+      sourceSlot: 0,
+      taskSource: "opencode",
+      host,
+      threadKey: "remote\0revision",
+      title: "Intermediate",
+      status: "complete",
+      selected: false,
+      activityAt: Date.now(),
+      observedAt: Date.now(),
+    },
+  ];
+  deck.controller.setAgentDisplaySettings({ taskSource: "All", activeQueueEnabled: true });
+  await drain();
+  deck.openCode.openCodeSlots[0]!.title = "Final remote";
+  deck.controller.setAgentDisplaySettings({ taskSource: "All", activeQueueEnabled: false, showContextRings: false });
+  await drain();
+  assert.equal(started.length, 1, "the SDK must not receive overlapping revisions");
+  gate.resolve();
+  await drain();
+  assert.deepEqual(key.images.map(keyLabel), ["Task 1", "Final remote"]);
+  await deck.controller.sendAgent(0, 0, { id: key.action.id });
+  assert.deepEqual(deck.codex.sends, [
+    [0, 1, input.slots[0]!.threadKey],
+    [0, 0, input.slots[0]!.threadKey],
+  ]);
+  await deck.controller.toggleTargetHost();
+  assert.equal(started.length, 2, "an unchanged final picture is not sent again");
+});
+
+test("SDK delivery continues a queued revision after failure without retrying the failed revision in a loop", async (context) => {
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("queued-after-failure");
+  deck.controller.registerHostToggle(key.action);
+  await drain();
+  const gate = defer();
+  let calls = 0;
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    calls++;
+    if (calls === 1) {
+      await gate.promise;
+      throw new Error("held image failed");
+    }
+    key.images.push(decodeURIComponent(image));
+  });
+  deck.codex.localHealth = { state: "ready", changedAt: 2 };
+  const first = deck.controller.toggleTargetHost();
+  const rejected = assert.rejects(first, /held image failed/);
+  await drain();
+  deck.codex.localHealth = { state: "offline", changedAt: 3 };
+  const next = deck.controller.toggleTargetHost().catch(() => undefined);
+  await drain();
+  assert.equal(calls, 1, "a pending SDK write serializes the later revision");
+  gate.resolve();
+  await Promise.all([rejected, next]);
+  assert.equal(calls, 2, "the accumulated revision follows the rejection");
+  assert.match(key.images.at(-1)!, /data-host-health="offline"/);
+  await drain();
+  assert.equal(calls, 2, "no timer or tight retry is introduced");
+});
+
+test("SDK delivery does not send another image to a retired registration after its held title completes", async (context) => {
+  const events = titleEvents(context);
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const old = fakeKey("retired-sdk");
+  deck.controller.registerHostToggle(old.action);
+  await drain();
+  const gate = defer();
+  context.mock.method(old.action, "setTitle", async (title: string) => {
+    old.titles.push(title);
+    await gate.promise;
+  });
+  events.dispatch(old, "External");
+  const pending = deck.controller.toggleTargetHost();
+  await drain();
+  deck.codex.localHealth = { state: "ready", changedAt: 2 };
+  const queued = deck.controller.toggleTargetHost();
+  await drain();
+  deck.controller.unregisterHostToggle(old.action);
+  const next = fakeKey(old.action.id);
+  deck.controller.registerHostToggle(next.action);
+  gate.resolve();
+  await Promise.all([pending, queued]);
+  await drain();
+  assert.equal(old.images.length, 1, "the retired action receives no queued image");
+  assert.equal(next.images.length, 1, "a same-id registration has its own delivery cache");
+  assert.deepEqual(next.titles, [""]);
+});
+
+test("SDK delivery across stop and restart does not inherit the held generation's image cache", async (context) => {
+  const deck = createDeck();
+  await startDeck(context, deck, { mockTimers: true });
+  const key = fakeKey("restarted-sdk");
+  const gate = defer();
+  let writes = 0;
+  context.mock.method(key.action, "setImage", async (image: string) => {
+    writes++;
+    if (writes === 1) await gate.promise;
+    key.images.push(decodeURIComponent(image));
+  });
+  deck.controller.registerHostToggle(key.action);
+  await drain();
+  deck.controller.stop();
+  const restarting = deck.controller.start();
+  await drain();
+  assert.equal(writes, 1, "restart does not overlap the old SDK call");
+  gate.resolve();
+  await restarting;
+  await drain();
+  assert.equal(writes, 2, "the new generation sends even an identical image itself");
+  assert.deepEqual(key.titles, ["", ""], "the new generation clears its own title");
+});
 
 test("concurrent public renders share a title clear and retry a failed clear with unchanged image", async (context) => {
   const events = titleEvents(context);
@@ -1216,10 +1636,11 @@ test("disappearance and same-id registration isolate late title completion for A
     if (kind === "agent") deck.controller.registerAgent(0, next.action);
     else deck.controller.registerHostToggle(next.action);
     await drain();
-    assert.deepEqual(next.titles, [""], "the new context sends its own clear");
-    events.dispatch(next, "External after registration");
+    assert.deepEqual(next.titles, [], "the next context waits for the already-started SDK call");
     oldGate.resolve();
     await drain();
+    assert.deepEqual(next.titles, [""], "the new context sends its own clear");
+    events.dispatch(next, "External after registration");
     await deck.controller.toggleTargetHost();
     assert.deepEqual(next.titles, ["", ""], "the old success cannot suppress a new context clear");
     if (kind === "agent") deck.controller.registerAgent(0, next.action);
@@ -1246,6 +1667,7 @@ test("nonempty title events survive an in-flight clear, ignore empty echoes, and
   });
   events.dispatch(key, "External");
   const clear = deck.controller.toggleTargetHost();
+  await drain();
   events.dispatch(key, "Changed during send");
   gate.resolve();
   await clear;
@@ -1306,8 +1728,176 @@ for (const outcome of ["disappearance", "replacement", "stop"] as const) {
     }
     if (outcome === "stop") {
       await deck.controller.start();
+      await drain();
       assert.equal(old.images.length, 1, "the current fixed registration still renders after restart");
       assert.deepEqual(old.titles, [""]);
     }
   });
 }
+
+for (const held of ["T3 preparation", "T3 refresh", "quota"] as const) {
+  test(`independent controller cadence publishes three Codex revisions during held ${held}`, async (context) => {
+    const deck = createDeck();
+    const gate = defer<void>();
+    context.after(() => gate.resolve());
+    let t3Refreshes = 0;
+    if (held === "T3 preparation") deck.openCode.syncDemand = async () => gate.promise;
+    deck.t3Code.refresh = async () => {
+      t3Refreshes++;
+      if (held === "T3 refresh") await gate.promise;
+    };
+    if (held === "quota") {
+      const original = fsPromises.open;
+      context.mock.method(fsPromises, "open", (async (...args: Parameters<typeof fsPromises.open>) => {
+        if (String(args[0]).endsWith("widget-snapshot.json")) await gate.promise;
+        return original(...args);
+      }) as typeof fsPromises.open);
+      syncBuiltinESMExports();
+      context.after(syncBuiltinESMExports);
+    }
+    deck.codex.localHealth = { state: "ready", changedAt: 1 };
+    deck.codex.refresh = async () => {
+      deck.codex.refreshes++;
+      const next = createMicroSnapshot();
+      next.slots[0]!.title = `Local revision ${deck.codex.refreshes}`;
+      deck.codex.localSnapshot = { host, snapshot: next, observedAt: Date.now() };
+    };
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    context.mock.method(streamDeck.settings, "getGlobalSettings", (async () => ({})) as never);
+    await isolateHome(context);
+    context.after(() => deck.controller.stop());
+    const key = fakeKey(`held-${held}`);
+    deck.controller.registerAgent(0, key.action);
+    void deck.controller.start();
+    await drain();
+    for (let revision = 1; revision <= 3; revision++) {
+      if (revision > 1) {
+        context.mock.timers.tick(1_200);
+        await drain();
+      }
+      assert.equal(keyLabel(key.images.at(-1)), `Local revision ${revision}`);
+    }
+    assert.equal(t3Refreshes, 3, "the existing clock triggers T3 regardless of other pending owners");
+  });
+}
+
+test("controller cadence keeps T3 moving while Codex and SDK are held", async (context) => {
+  const deck = createDeck();
+  const codexGate = defer<void>();
+  const sdkGate = defer<void>();
+  context.after(() => {
+    codexGate.resolve();
+    sdkGate.resolve();
+  });
+  let t3Refreshes = 0;
+  deck.t3Code.refresh = async () => {
+    t3Refreshes++;
+  };
+  deck.codex.refreshGate = codexGate.promise;
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  context.mock.method(streamDeck.settings, "getGlobalSettings", (async () => ({})) as never);
+  await isolateHome(context);
+  context.after(() => deck.controller.stop());
+  const key = fakeKey("held-sdk-and-codex");
+  context.mock.method(key.action, "setImage", async () => sdkGate.promise);
+  deck.controller.registerAgent(0, key.action);
+  void deck.controller.start();
+  await drain();
+  for (let tick = 0; tick < 3; tick++) {
+    context.mock.timers.tick(1_200);
+    await drain();
+  }
+  assert.equal(deck.codex.refreshes, 1, "Codex polls do not overlap");
+  assert.equal(t3Refreshes, 4, "T3 retains every independent 1200ms trigger");
+});
+
+test("late startup settings cannot alter a restarted controller or schedule its old clocks", async (context) => {
+  const deck = createDeck();
+  const gate = defer<AgentDisplaySettings>();
+  context.after(() => gate.resolve({ taskSource: "T3 Code" }));
+  let reads = 0;
+  context.mock.method(streamDeck.settings, "getGlobalSettings", (async () =>
+    ++reads === 1 ? gate.promise : { taskSource: "Codex" }) as never);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  await isolateHome(context);
+  context.after(() => deck.controller.stop());
+  deck.codex.localHealth = { state: "ready", changedAt: 1 };
+  deck.codex.localSnapshot = { host, snapshot: createMicroSnapshot(), observedAt: Date.now() };
+  const key = fakeKey("late-settings");
+  deck.controller.registerAgent(0, key.action);
+  const old = deck.controller.start();
+  deck.controller.stop();
+  await deck.controller.start();
+  await drain();
+  gate.resolve({ taskSource: "T3 Code" });
+  await old;
+  await drain();
+  assert.equal(keyLabel(key.images.at(-1)), "Task 1");
+  assert.equal(deck.codex.refreshes, 1);
+  context.mock.timers.tick(1_200);
+  await drain();
+  assert.equal(deck.codex.refreshes, 2, "only the new generation schedules a poll");
+});
+
+test("late Codex start cannot create an old controller poll after restart", async (context) => {
+  const deck = createDeck();
+  const old = defer<void>();
+  context.after(() => old.resolve());
+  let starts = 0;
+  deck.codex.start = async () => {
+    if (++starts === 1) await old.promise;
+  };
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  context.mock.method(streamDeck.settings, "getGlobalSettings", (async () => ({})) as never);
+  await isolateHome(context);
+  context.after(() => deck.controller.stop());
+  const starting = deck.controller.start();
+  await drain();
+  deck.controller.stop();
+  await deck.controller.start();
+  await drain();
+  old.resolve();
+  await starting;
+  context.mock.timers.tick(1_200);
+  await drain();
+  assert.equal(starts, 2);
+  assert.equal(deck.codex.refreshes, 2, "only the fresh start and fresh clock poll Codex");
+});
+
+test("source notifications publish three T3 commits while Codex is held", async (context) => {
+  const deck = createDeck();
+  const old = defer<void>();
+  context.after(() => old.resolve());
+  deck.codex.refreshGate = old.promise;
+  let changed!: () => void;
+  deck.t3Code.subscribe = (listener) => {
+    changed = listener;
+    return () => {
+      changed = () => {};
+    };
+  };
+  deck.t3Code.health = { state: "ready", changedAt: 1 };
+  await startDeck(context, deck, { settings: { taskSource: "T3 Code" }, mockTimers: true });
+  const key = fakeKey("notified-t3");
+  deck.controller.registerAgent(0, key.action);
+  for (let revision = 1; revision <= 3; revision++) {
+    deck.t3Code.slots = [
+      {
+        id: 0,
+        sourceSlot: 0,
+        taskSource: "t3code",
+        host,
+        threadKey: "environment\0thread",
+        title: `T3 revision ${revision}`,
+        status: "working",
+        selected: false,
+        observedAt: Date.now(),
+      },
+    ];
+    changed();
+    changed();
+    await drain();
+    assert.equal(keyLabel(key.images.at(-1)), `T3 revision ${revision}`);
+  }
+  assert.equal(deck.codex.refreshes, 1);
+});

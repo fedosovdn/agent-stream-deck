@@ -45,9 +45,10 @@ type AgentRegistration = { action: KeyAction<{}>; slot: number };
 type MicroActionRegistration = { action: KeyAction<{}>; slot: MicroActionSlot };
 type UsageLimitRegistration = { action: KeyAction<{}>; mode: UsageLimitMode };
 type ActionIdentity = { id: string };
-type TitleClearState = { action: KeyAction<{}>; revision: number; cleared: boolean; pending?: Promise<void> };
+type DisplayState = { action: KeyAction<{}>; generation: number; revision: number; cleared: boolean; image?: string };
 type AgentPress = { assignment?: RoutedAgentSlot; down: Promise<void>; abort: AbortController };
 type AgentButton = { press?: AgentPress; active: Set<AgentPress>; tail?: Promise<void> };
+type DisplayPass = { promise: Promise<void>; resolve(): void; reject(error: unknown): void };
 export type AgentDisplaySettings = {
   showContextRings?: boolean;
   activeQueueEnabled?: boolean;
@@ -63,8 +64,13 @@ export class DeckController {
   private readonly microActions = new Map<string, MicroActionRegistration>();
   private readonly fixedActions = new Map<string, FixedIconRegistration>();
   private readonly keycapImages = new Map<string, Promise<string | null>>();
-  private readonly lastImages = new Map<string, string>();
-  private readonly titleClears = new Map<string, TitleClearState>();
+  private readonly displayStates = new Map<string, DisplayState>();
+  private displayGeneration = 0;
+  private desiredDisplayRevision = 0;
+  private attemptedDisplayRevision = 0;
+  private displayNeedsAll = false;
+  private displayInFlight?: Promise<void>;
+  private nextDisplayPass?: DisplayPass;
   private titleListener?: ReturnType<typeof streamDeck.actions.onTitleParametersDidChange>;
   private readonly hostToggleActions = new Map<string, KeyAction<{}>>();
   private readonly usageLimitActions = new Map<string, UsageLimitRegistration>();
@@ -78,6 +84,10 @@ export class DeckController {
   private poll?: NodeJS.Timeout;
   private animation?: NodeJS.Timeout;
   private refreshInFlight?: Promise<void>;
+  private quotaInFlight?: Promise<void>;
+  private sourceUnsubscribes: (() => void)[] = [];
+  private projectionQueued = false;
+  private codexStarted = false;
   private stopped = false;
   private animationFrame = 0;
   private lastAssignmentSignature = "";
@@ -102,40 +112,76 @@ export class DeckController {
   }
 
   async start(): Promise<void> {
+    const generation = ++this.displayGeneration;
+    if (this.poll) clearTimeout(this.poll);
+    if (this.animation) clearTimeout(this.animation);
+    this.refreshInFlight = undefined;
+    this.quotaInFlight = undefined;
+    this.codexStarted = false;
+    this.displayStates.clear();
     this.stopped = false;
+    for (const unsubscribe of this.sourceUnsubscribes) unsubscribe();
+    this.sourceUnsubscribes = [this.openCode, this.t3Code].map((source) =>
+      source.subscribe(() => {
+        if (this.isCurrentGeneration(generation)) this.requestProjection();
+      }),
+    );
     this.titleListener?.dispose();
     this.titleListener = streamDeck.actions.onTitleParametersDidChange((event) => {
       if (!event.payload.title) return;
-      const state = this.titleClears.get(event.action.id);
-      if (state) {
+      const state = this.displayStates.get(event.action.id);
+      if (state?.action === event.action) {
         state.revision++;
         state.cleared = false;
+        this.requestRender();
       }
     });
-    await this.loadAgentDisplaySettings();
+    await this.loadAgentDisplaySettings(generation);
+    if (!this.isCurrentGeneration(generation)) return;
+    void this.syncTaskSourceDemand().catch((error) =>
+      streamDeck.logger.error(`Source preparation failed: ${String(error)}`),
+    );
+    this.refreshOwners();
+    this.scheduleRefresh(generation);
+    this.scheduleAnimation(generation);
     await this.codex.start();
-    await this.syncTaskSourceDemand();
-    await this.refresh();
-    this.scheduleRefresh();
-    this.scheduleAnimation();
+    if (!this.isCurrentGeneration(generation)) return;
+    this.codexStarted = true;
+    void this.syncTaskSourceDemand().catch((error) =>
+      streamDeck.logger.error(`Source preparation failed: ${String(error)}`),
+    );
+    void this.refresh();
+    void this.refreshDisplay().catch((error) => streamDeck.logger.error(`Display projection failed: ${String(error)}`));
   }
 
-  private async loadAgentDisplaySettings(): Promise<void> {
+  private isCurrentGeneration(generation: number): boolean {
+    return !this.stopped && generation === this.displayGeneration;
+  }
+
+  private async loadAgentDisplaySettings(generation: number): Promise<void> {
     try {
       const settings = await streamDeck.settings.getGlobalSettings<AgentDisplaySettings>();
+      if (!this.isCurrentGeneration(generation)) return;
       this.showContextRings = settings.showContextRings !== false;
       this.activeQueueEnabled = settings.activeQueueEnabled === true;
       this.taskSource = parseTaskSource(settings.taskSource);
     } catch (error) {
-      streamDeck.logger.warn(`Agent display settings were unavailable; using defaults: ${String(error)}`);
+      if (this.isCurrentGeneration(generation))
+        streamDeck.logger.warn(`Agent display settings were unavailable; using defaults: ${String(error)}`);
     }
   }
 
   stop(): void {
     this.stopped = true;
+    this.displayGeneration++;
     this.titleListener?.dispose();
     this.titleListener = undefined;
-    this.titleClears.clear();
+    this.displayStates.clear();
+    for (const unsubscribe of this.sourceUnsubscribes) unsubscribe();
+    this.sourceUnsubscribes = [];
+    this.codexStarted = false;
+    this.refreshInFlight = undefined;
+    this.quotaInFlight = undefined;
     if (this.poll) clearInterval(this.poll);
     if (this.animation) clearInterval(this.animation);
     for (const button of this.agentButtons.values()) for (const press of button.active) press.abort.abort();
@@ -146,9 +192,9 @@ export class DeckController {
   }
 
   registerAgent(slot: number, action: KeyAction<{}>): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.agents.set(action.id, { action, slot });
-    void this.renderAgent({ action, slot });
+    this.requestRender();
   }
 
   unregisterAgent(action: ActionIdentity): void {
@@ -172,24 +218,19 @@ export class DeckController {
     if (activeQueueChanged || taskSourceChanged) {
       this.activeQueueRankIndex.clear();
       if (taskSourceChanged) {
-        const synchronize = this.syncTaskSourceDemand();
-        void this.refreshDisplay().catch(() => streamDeck.logger.error("Agent display settings refresh failed."));
-        void synchronize
-          .then(() => this.t3Code.refresh())
-          .then(() => this.refreshDisplay())
-          .catch(() => streamDeck.logger.error("Agent display settings refresh failed."));
-      } else {
-        void this.refreshDisplay().catch(() => streamDeck.logger.error("Agent display settings refresh failed."));
+        void this.syncTaskSourceDemand().catch(() => streamDeck.logger.error("Agent display settings refresh failed."));
+        void this.t3Code.refresh().catch(() => streamDeck.logger.error("T3 refresh failed."));
       }
+      void this.refreshDisplay().catch(() => streamDeck.logger.error("Agent display settings refresh failed."));
     } else {
-      void Promise.all([...this.agents.values()].map((registration) => this.renderAgent(registration)));
+      this.requestRender();
     }
   }
 
   registerMicroAction(slot: MicroActionSlot, action: KeyAction<{}>): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.microActions.set(action.id, { action, slot });
-    void this.renderMicroAction({ action, slot });
+    this.requestRender();
   }
 
   unregisterMicroAction(action: ActionIdentity): void {
@@ -197,9 +238,9 @@ export class DeckController {
   }
 
   registerFixedAction(action: KeyAction<{}>, source: FixedIconSource): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.fixedActions.set(action.id, { action, source });
-    void this.renderFixedAction({ action, source });
+    this.requestRender();
   }
 
   unregisterFixedAction(action: ActionIdentity): void {
@@ -207,9 +248,9 @@ export class DeckController {
   }
 
   registerHostToggle(action: KeyAction<{}>): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.hostToggleActions.set(action.id, action);
-    void this.renderHostToggle(action);
+    this.requestRender();
   }
 
   unregisterHostToggle(action: ActionIdentity): void {
@@ -217,17 +258,17 @@ export class DeckController {
   }
 
   registerUsageLimit(action: KeyAction<{}>, mode: UsageLimitMode): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     const registration = { action, mode };
     this.usageLimitActions.set(action.id, registration);
-    this.renderUsageAction("Usage limit", action, () => this.renderUsageLimit(registration));
+    this.renderUsageAction("Usage limit", action);
   }
 
   updateUsageLimitMode(action: KeyAction<{}>, mode: UsageLimitMode): void {
-    if (this.usageLimitActions.get(action.id)?.action !== action) this.resetTitleClear(action);
+    if (this.usageLimitActions.get(action.id)?.action !== action) this.resetDisplayState(action);
     const registration = { action, mode };
     this.usageLimitActions.set(action.id, registration);
-    this.renderUsageAction("Usage limit", action, () => this.renderUsageLimit(registration));
+    this.renderUsageAction("Usage limit", action);
   }
 
   unregisterUsageLimit(action: ActionIdentity): void {
@@ -235,9 +276,9 @@ export class DeckController {
   }
 
   registerUsageOverview(action: KeyAction<{}>): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.usageOverviewActions.set(action.id, action);
-    this.renderUsageAction("Usage overview", action, () => this.renderUsageOverview(action));
+    this.renderUsageAction("Usage overview", action);
   }
 
   unregisterUsageOverview(action: ActionIdentity): void {
@@ -245,9 +286,9 @@ export class DeckController {
   }
 
   registerRateLimitReset(action: KeyAction<{}>): void {
-    this.resetTitleClear(action);
+    this.resetDisplayState(action);
     this.rateLimitResetActions.set(action.id, action);
-    this.renderUsageAction("Rate-limit reset", action, () => this.renderRateLimitReset(action));
+    this.renderUsageAction("Rate-limit reset", action);
   }
 
   unregisterRateLimitReset(action: ActionIdentity): void {
@@ -355,21 +396,56 @@ export class DeckController {
     await openCodexThread("new");
   }
 
-  private async refresh(): Promise<void> {
+  private refresh(): Promise<void> {
+    if (this.stopped || !this.codexStarted) return Promise.resolve();
     if (this.refreshInFlight) return this.refreshInFlight;
-    const pending = this.refreshOnce();
+    const generation = this.displayGeneration;
+    const pending = this.codex
+      .refresh()
+      .then(() => {
+        if (this.isCurrentGeneration(generation)) this.requestProjection();
+      })
+      .catch((error) => {
+        if (this.isCurrentGeneration(generation)) streamDeck.logger.error(`Codex refresh failed: ${String(error)}`);
+      });
     this.refreshInFlight = pending;
-    try {
-      await pending;
-    } finally {
+    void pending.finally(() => {
       if (this.refreshInFlight === pending) this.refreshInFlight = undefined;
-    }
+    });
+    return pending;
   }
 
-  private async refreshOnce(): Promise<void> {
-    if (process.platform === "darwin") this.codexBarUsage = await readCodexBarUsage();
-    await Promise.all([this.codex.refresh(), this.t3Code.refresh()]);
-    await this.refreshDisplay();
+  private refreshOwners(): void {
+    if (this.stopped) return;
+    void this.refresh();
+    void this.t3Code.refresh().catch((error) => streamDeck.logger.error(`T3 refresh failed: ${String(error)}`));
+    if (process.platform !== "darwin" || this.quotaInFlight) return;
+    const generation = this.displayGeneration;
+    const pending = readCodexBarUsage()
+      .then((usage) => {
+        if (!this.isCurrentGeneration(generation)) return;
+        this.codexBarUsage = usage;
+        this.requestProjection();
+      })
+      .catch((error) => {
+        if (this.isCurrentGeneration(generation)) streamDeck.logger.error(`Quota refresh failed: ${String(error)}`);
+      });
+    this.quotaInFlight = pending;
+    void pending.finally(() => {
+      if (this.quotaInFlight === pending) this.quotaInFlight = undefined;
+    });
+  }
+
+  private requestProjection(): void {
+    if (this.stopped || this.projectionQueued) return;
+    this.projectionQueued = true;
+    setImmediate(() => {
+      this.projectionQueued = false;
+      if (!this.stopped)
+        void this.refreshDisplay().catch((error) =>
+          streamDeck.logger.error(`Display projection failed: ${String(error)}`),
+        );
+    });
   }
 
   private syncTaskSourceDemand(): Promise<void> {
@@ -425,16 +501,96 @@ export class DeckController {
     await this.renderAll();
   }
 
-  private async renderAll(): Promise<void> {
-    await Promise.all([
-      ...[...this.agents.values()].map((registration) => this.renderAgent(registration)),
-      ...[...this.microActions.values()].map((registration) => this.renderMicroAction(registration)),
-      ...[...this.fixedActions.values()].map((registration) => this.renderFixedAction(registration)),
-      ...[...this.hostToggleActions.values()].map((action) => this.renderHostToggle(action)),
-      ...[...this.usageLimitActions.values()].map((registration) => this.renderUsageLimit(registration)),
-      ...[...this.usageOverviewActions.values()].map((action) => this.renderUsageOverview(action)),
-      ...[...this.rateLimitResetActions.values()].map((action) => this.renderRateLimitReset(action)),
-    ]);
+  private requestRender(): void {
+    void this.renderAll().catch((error) => streamDeck.logger.error(`Display render failed: ${String(error)}`));
+  }
+
+  private renderAll(animatedOnly = false): Promise<void> {
+    this.desiredDisplayRevision++;
+    if (!animatedOnly) this.displayNeedsAll = true;
+    // Input waits for the pass containing its revision, never for an endless animation drain.
+    if (!this.nextDisplayPass) {
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<void>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
+      this.nextDisplayPass = { promise, resolve, reject };
+    }
+    const requested = this.nextDisplayPass.promise;
+    if (this.displayInFlight) return requested;
+    const pending = Promise.resolve().then(async () => {
+      while (!this.stopped && this.attemptedDisplayRevision !== this.desiredDisplayRevision) {
+        const pass = this.nextDisplayPass;
+        this.nextDisplayPass = undefined;
+        this.attemptedDisplayRevision = this.desiredDisplayRevision;
+        const animatedOnly = !this.displayNeedsAll;
+        this.displayNeedsAll = false;
+        try {
+          await this.renderOnce(animatedOnly);
+          pass?.resolve();
+        } catch (error) {
+          pass?.reject(error);
+        }
+      }
+      this.nextDisplayPass?.resolve();
+      this.nextDisplayPass = undefined;
+    });
+    this.displayInFlight = pending;
+    void pending
+      .finally(() => {
+        if (this.displayInFlight !== pending) return;
+        this.displayInFlight = undefined;
+        if (!this.stopped && this.attemptedDisplayRevision !== this.desiredDisplayRevision) this.requestRender();
+      })
+      .catch(() => undefined);
+    return requested;
+  }
+
+  private async renderOnce(animatedOnly: boolean): Promise<void> {
+    const generation = this.displayGeneration;
+    const registeredRender = (action: KeyAction<{}>, draw: () => Promise<void>) => {
+      const state = this.displayState(action);
+      return async () => {
+        if (state && this.isCurrentDisplay(state)) await draw();
+      };
+    };
+    const agents = [...this.agents.values()].filter(({ slot }) => !animatedOnly || this.isAnimatedAgent(slot));
+    const renders = agents.map((registration) =>
+      registeredRender(registration.action, () => this.renderAgent(registration)),
+    );
+    if (!animatedOnly)
+      renders.push(
+        ...[...this.microActions.values()].map((registration) =>
+          registeredRender(registration.action, () => this.renderMicroAction(registration)),
+        ),
+        ...[...this.fixedActions.values()].map((registration) =>
+          registeredRender(registration.action, () => this.renderFixedAction(registration)),
+        ),
+        ...[...this.hostToggleActions.values()].map((action) =>
+          registeredRender(action, () => this.renderHostToggle(action)),
+        ),
+        ...[...this.usageLimitActions.values()].map((registration) =>
+          registeredRender(registration.action, () => this.renderUsageLimit(registration)),
+        ),
+        ...[...this.usageOverviewActions.values()].map((action) =>
+          registeredRender(action, () => this.renderUsageOverview(action)),
+        ),
+        ...[...this.rateLimitResetActions.values()].map((action) =>
+          registeredRender(action, () => this.renderRateLimitReset(action)),
+        ),
+      );
+    let failure: unknown;
+    for (const render of renders) {
+      if (this.stopped || generation !== this.displayGeneration) return;
+      try {
+        await render();
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (failure) throw failure;
   }
 
   private async renderAgent({ action, slot }: AgentRegistration): Promise<void> {
@@ -475,37 +631,34 @@ export class DeckController {
     );
   }
 
+  private isAnimatedAgent(slot: number): boolean {
+    const agent = this.routedSlots[slot];
+    if (!agent) return false;
+    const status = visualStatusFromMicro(agent.status);
+    return status === "thinking" || status === "input";
+  }
+
   private async renderAnimatedAgents(): Promise<void> {
-    const registrations = [...this.agents.values()].filter(({ slot }) => {
-      const agent = this.routedSlots[slot];
-      if (!agent) return false;
-      const status = visualStatusFromMicro(agent.status);
-      return status === "thinking" || status === "input";
-    });
-    await Promise.all(
-      registrations.map((registration) =>
-        this.renderAgent(registration).catch((error) =>
-          streamDeck.logger.error(`Agent animation ${registration.slot + 1} failed: ${String(error)}`),
-        ),
-      ),
-    );
+    if ([...this.agents.values()].some(({ slot }) => this.isAnimatedAgent(slot))) await this.renderAll(true);
   }
 
   private async renderMicroAction({ action, slot }: MicroActionRegistration): Promise<void> {
+    const state = this.displayState(action);
     const snapshot = this.targetSnapshot();
     const keycapId = snapshot?.layout.slots[slot]?.keycapId;
     if (!keycapId) return;
     const image = await this.keycapImage(keycapId, snapshot?.theme ?? "dark");
-    if (image) await this.setImage(action, image);
+    if (image) await this.setImage(action, image, state);
   }
 
   private async renderFixedAction(registration: FixedIconRegistration): Promise<void> {
+    const state = this.displayState(registration.action);
     const theme = this.targetSnapshot()?.theme ?? "dark";
     const image =
       registration.source.kind === "builtin"
         ? renderBuiltinKeycap(registration.source.name, theme)
         : await this.keycapImage(registration.source.keycapId, theme);
-    if (image) await this.setImage(registration.action, image);
+    if (image) await this.setImage(registration.action, image, state);
   }
 
   private async renderHostToggle(action: KeyAction<{}>): Promise<void> {
@@ -571,9 +724,9 @@ export class DeckController {
     );
   }
 
-  private async setImage(action: KeyAction<{}>, image: string): Promise<void> {
-    if (this.stopped) return;
-    let state = this.titleClears.get(action.id);
+  private displayState(action: KeyAction<{}>): DisplayState | undefined {
+    if (this.stopped) return undefined;
+    let state = this.displayStates.get(action.id);
     if (!state) {
       const registeredAction =
         this.agents.get(action.id)?.action ??
@@ -583,78 +736,69 @@ export class DeckController {
         this.usageLimitActions.get(action.id)?.action ??
         this.usageOverviewActions.get(action.id) ??
         this.rateLimitResetActions.get(action.id);
-      if (registeredAction !== action) return;
-      state = { action, revision: 0, cleared: false };
-      this.titleClears.set(action.id, state);
+      if (registeredAction !== action) return undefined;
+      state = { action, generation: this.displayGeneration, revision: 0, cleared: false };
+      this.displayStates.set(action.id, state);
     }
-    if (state.action !== action) return;
-    if (this.lastImages.get(action.id) === image && state.cleared) return;
-    const updateImage =
-      this.lastImages.get(action.id) === image
-        ? Promise.resolve()
-        : action.setImage(image).then(() => {
-            if (this.titleClears.get(action.id) === state) this.lastImages.set(action.id, image);
-          });
-    await Promise.all([updateImage, this.clearTitle(state)]);
+    return state.action === action ? state : undefined;
   }
 
-  private resetTitleClear(action: KeyAction<{}>): void {
-    this.titleClears.set(action.id, { action, revision: 0, cleared: false });
-  }
-
-  private clearTitle(state: TitleClearState): Promise<void> {
-    if (state.cleared) return Promise.resolve();
-    if (state.pending) return state.pending;
-    const revision = state.revision;
-    state.pending = state.action.setTitle("").then(
-      () => {
-        if (state.revision === revision) state.cleared = true;
-        state.pending = undefined;
-      },
-      (error) => {
-        state.pending = undefined;
-        throw error;
-      },
+  private isCurrentDisplay(state: DisplayState): boolean {
+    return (
+      !this.stopped && state.generation === this.displayGeneration && this.displayStates.get(state.action.id) === state
     );
-    return state.pending;
+  }
+
+  private async setImage(action: KeyAction<{}>, image: string, state = this.displayState(action)): Promise<void> {
+    if (!state || !this.isCurrentDisplay(state)) return;
+    if (!state.cleared) {
+      const revision = state.revision;
+      await action.setTitle("");
+      if (!this.isCurrentDisplay(state)) return;
+      if (state.revision === revision) state.cleared = true;
+    }
+    if (!this.isCurrentDisplay(state) || state.image === image) return;
+    await action.setImage(image);
+    if (this.isCurrentDisplay(state)) state.image = image;
+  }
+
+  private resetDisplayState(action: KeyAction<{}>): void {
+    this.displayStates.set(action.id, { action, generation: this.displayGeneration, revision: 0, cleared: false });
   }
 
   private effectiveActiveQueueEnabled(): boolean {
     return usesActiveQueue(this.taskSource, this.activeQueueEnabled);
   }
 
-  private renderUsageAction(label: string, action: KeyAction<{}>, render: () => Promise<void>): void {
-    void render()
+  private renderUsageAction(label: string, action: KeyAction<{}>): void {
+    void this.renderAll()
       .then(() => streamDeck.logger.info(`${label} action rendered (${action.id}).`))
       .catch((error) => streamDeck.logger.error(`${label} action render failed (${action.id}): ${String(error)}`));
   }
 
   private unregister<T>(action: ActionIdentity, registrations: Map<string, T>): void {
     registrations.delete(action.id);
-    this.lastImages.delete(action.id);
-    this.titleClears.delete(action.id);
+    this.displayStates.delete(action.id);
   }
 
-  private scheduleRefresh(): void {
-    if (this.stopped) return;
-    this.poll = setTimeout(async () => {
-      try {
-        await this.refresh();
-      } finally {
-        this.scheduleRefresh();
-      }
+  private scheduleRefresh(generation: number): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    this.poll = setTimeout(() => {
+      if (!this.isCurrentGeneration(generation)) return;
+      this.refreshOwners();
+      this.scheduleRefresh(generation);
     }, 1_200);
   }
 
-  private scheduleAnimation(): void {
-    if (this.stopped) return;
-    this.animation = setTimeout(async () => {
+  private scheduleAnimation(generation: number): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    this.animation = setTimeout(() => {
+      if (!this.isCurrentGeneration(generation)) return;
       this.animationFrame = (this.animationFrame + 1) % 12;
-      try {
-        await this.renderAnimatedAgents();
-      } finally {
-        this.scheduleAnimation();
-      }
+      void this.renderAnimatedAgents().catch((error) =>
+        streamDeck.logger.error(`Animation render failed: ${String(error)}`),
+      );
+      this.scheduleAnimation(generation);
     }, 200);
   }
 

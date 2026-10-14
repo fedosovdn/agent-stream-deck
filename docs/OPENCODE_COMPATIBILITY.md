@@ -62,8 +62,8 @@ connections. The acknowledgement is never sent through a relay and is
 invalidated by a later terminal timestamp for the same opaque task identity. A
 successful or failed terminal result remains visible until it is viewed,
 acknowledged, or reaches five minutes after its normalized terminal event. The
-five-second polling cycle performs the removal, so the display may lag the exact
-deadline by one poll. Older terminal history present when monitoring starts is
+five-second polling cadence schedules the removal; a pending collection or
+admission wait can delay it beyond the next tick. Older terminal history present when monitoring starts is
 not backfilled. OpenCode
 Desktop `2.0.10` still clears its own renderer notification locally when a chat
 opens, so opening a chat does not reliably publish `time.viewed` by itself.
@@ -84,7 +84,19 @@ user, and carries exactly the command line the collector builds for a saved
 connection. The running plugin's tunnels and all other SSH processes are left
 alone.
 
-The source-separation update preserves the characterized API contract above.
+Each admitted environment publishes its completed snapshot without waiting for
+the other environments. Initial local discovery does not wait for saved SSH
+discovery. The collector retains at most three running collections and two SSH
+discoveries: one place conditionally prefers waiting local work, while the
+remaining places preserve FIFO progress for remote work. Running remote work
+is not cancelled to make room for a later local job. The first 17 admitted
+connections prefer sorted local registrations; they may all be local. Saved SSH
+settings still allow up to 16 profiles, and failed discovery diagnostics can
+appear beyond the admitted slice. Protected registration replacement or removal
+invalidates only its own work; late results cannot restore it or an acknowledged
+terminal revision. Pending snapshots retain their original observation time.
+
+The independent-cycle update preserves the characterized API contract above.
 Its automated fixtures cover tunnel replacement, local acknowledgement before
 best-effort publication, new terminal revisions, and cancellation of old demand
 generations. No additional live OpenCode or Fedora version is claimed here.

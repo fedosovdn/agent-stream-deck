@@ -10,8 +10,23 @@ export class OpenCodeSource {
   openCodeHealth: HostHealth = { state: "connecting", reason: "awaiting-snapshot", changedAt: Date.now() };
   openCodeCollector?: OpenCodeCollector;
   private openCodeDemandGeneration = 0;
+  private preparation?: Promise<void>;
+  private identitySecretPreparation?: Promise<Buffer>;
   private localHost?: CodexHost;
   private demanded = false;
+  private readonly listeners = new Set<() => void>();
+  private unsubscribeCollector?: () => void;
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) listener();
+  }
 
   constructor(
     private readonly log: (message: string) => void,
@@ -21,6 +36,9 @@ export class OpenCodeSource {
   stop(): void {
     this.demanded = false;
     this.openCodeDemandGeneration++;
+    this.preparation = undefined;
+    this.unsubscribeCollector?.();
+    this.unsubscribeCollector = undefined;
     const collector = this.openCodeCollector;
     this.openCodeCollector = undefined;
     void collector?.stop();
@@ -45,22 +63,54 @@ export class OpenCodeSource {
     this.demanded = !stopped && shouldCollectOpenCode(taskSource, process.platform);
     this.localHost = host;
     const demanded = this.demanded;
-    if (demanded && this.openCodeCollector) return;
+    if (demanded && this.preparation) return this.preparation;
+    if (demanded && this.openCodeCollector) {
+      this.refreshOpenCodeSnapshot();
+      return;
+    }
     const generation = ++this.openCodeDemandGeneration;
     if (!demanded) {
+      this.preparation = undefined;
+      this.unsubscribeCollector?.();
+      this.unsubscribeCollector = undefined;
       const collector = this.openCodeCollector;
       this.openCodeCollector = undefined;
       this.openCodeSlots = [];
       this.openCodeHealth = { state: "connecting", reason: "awaiting-snapshot", changedAt: Date.now() };
+      this.notify();
       await collector?.stop();
       return;
     }
     this.openCodeHealth = { state: "connecting", reason: "awaiting-snapshot", changedAt: Date.now() };
+    const pending = this.prepareOpenCode(generation);
+    this.preparation = pending;
     try {
-      const secret = await getOrCreateOpenCodeIdentitySecret();
+      await pending;
+    } finally {
+      if (this.preparation === pending) this.preparation = undefined;
+    }
+  }
+
+  private async prepareOpenCode(generation: number): Promise<void> {
+    try {
+      // A cancelled generation may still be writing its new secret; renewed demand joins that write.
+      this.identitySecretPreparation ??= getOrCreateOpenCodeIdentitySecret();
+      const secretPreparation = this.identitySecretPreparation;
+      let secret: Buffer;
+      try {
+        secret = await secretPreparation;
+      } finally {
+        if (this.identitySecretPreparation === secretPreparation) this.identitySecretPreparation = undefined;
+      }
       if (generation !== this.openCodeDemandGeneration || !this.demanded) return;
       const collector = new OpenCodeCollector({ identitySecret: secret });
       this.openCodeCollector = collector;
+      this.unsubscribeCollector = collector.subscribe(() => {
+        if (generation !== this.openCodeDemandGeneration || !this.demanded || this.openCodeCollector !== collector)
+          return;
+        this.applyOpenCodeSnapshot(collector.snapshot());
+        this.notify();
+      });
       const snapshot = await collector.start();
       if (generation !== this.openCodeDemandGeneration || !this.demanded) {
         if (this.openCodeCollector === collector) this.openCodeCollector = undefined;
@@ -68,13 +118,18 @@ export class OpenCodeSource {
         return;
       }
       this.applyOpenCodeSnapshot(snapshot);
+      this.notify();
     } catch {
       if (generation !== this.openCodeDemandGeneration) return;
       const collector = this.openCodeCollector;
       this.openCodeCollector = undefined;
       await collector?.stop();
+      if (generation !== this.openCodeDemandGeneration) return;
       this.openCodeSlots = [];
       this.openCodeHealth = { state: "degraded", reason: "native-signals-unavailable", changedAt: Date.now() };
+      this.unsubscribeCollector?.();
+      this.unsubscribeCollector = undefined;
+      this.notify();
       this.log("OpenCode collector is unavailable.");
     }
   }
@@ -86,7 +141,7 @@ export class OpenCodeSource {
   }
 
   private applyOpenCodeSnapshot(snapshot: OpenCodeCollectorSnapshot): void {
-    if (!this.localHost) return;
+    if (!this.localHost || snapshot.observedAt === 0) return;
     const healthy = snapshot.connections.some(
       (connection) => connection.health === "ready" || connection.health === "capacity-exceeded",
     );

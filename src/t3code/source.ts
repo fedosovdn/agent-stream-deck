@@ -12,6 +12,16 @@ const TERMINAL_WINDOW_MS = 5 * 60_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 type RecordValue = Record<string, unknown>;
 type Options = { configPath?: string; runtimePath?: string; foreground?: () => Promise<void> };
+type LocalRuntime = { origin: string; token: string; pid: number };
+type Environment = {
+  namespace: string;
+  identity: string;
+  read: (request: AbortController) => Promise<RecordValue>;
+  slots: RoutedAgentSlot[];
+  state: "connecting" | "ready" | "degraded";
+  request?: AbortController;
+  pending?: Promise<void>;
+};
 
 export class T3CodeSource {
   slots: RoutedAgentSlot[] = [];
@@ -19,7 +29,10 @@ export class T3CodeSource {
   private host?: CodexHost;
   private demanded = false;
   private generation = 0;
-  private request?: AbortController;
+  private preparation?: Promise<void>;
+  private configurationFailed = false;
+  private readonly environments = new Map<string, Environment>();
+  private readonly listeners = new Set<() => void>();
   private readonly acknowledged = new Map<string, number>();
   private readonly configPath: string;
   private readonly runtimePath: string;
@@ -34,91 +47,189 @@ export class T3CodeSource {
     this.foreground = options.foreground ?? foregroundT3Code;
   }
 
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
   syncDemand(source: TaskSource, host: CodexHost | undefined, stopped: boolean): void {
     const demanded = !stopped && host?.platform === "darwin" && (source === "T3 Code" || source === "All");
+    const hostChanged = this.host?.hostId !== host?.hostId;
     this.host = host;
-    if (demanded === this.demanded) return;
+    if (demanded === this.demanded && !hostChanged) return;
     this.demanded = demanded;
     this.generation++;
-    this.request?.abort();
-    this.slots = [];
-    this.health = { state: "connecting", reason: "awaiting-snapshot", changedAt: Date.now() };
+    this.resetEnvironments();
+    this.preparation = undefined;
+    this.configurationFailed = false;
+    this.publish();
+    if (demanded) void this.refresh();
   }
 
   stop(): void {
     this.demanded = false;
     this.generation++;
-    this.request?.abort();
-    this.slots = [];
+    this.resetEnvironments();
+    this.preparation = undefined;
+    this.configurationFailed = false;
     this.acknowledged.clear();
+    this.publish();
   }
 
-  async refresh(): Promise<void> {
-    if (!this.demanded || !this.host) return;
+  // The caller supplies its existing cadence; each environment owns its pending work and commit.
+  refresh(): Promise<void> {
+    if (!this.demanded || !this.host) return Promise.resolve();
+    if (this.preparation) return this.preparation;
     const generation = this.generation;
-    this.request?.abort();
-    const request = new AbortController();
-    this.request = request;
+    const preparation = this.prepare(generation).finally(() => {
+      if (this.preparation === preparation) this.preparation = undefined;
+    });
+    this.preparation = preparation;
+    return preparation;
+  }
+
+  private async prepare(generation: number): Promise<void> {
     try {
       const config = await readPrivateConfig(this.configPath);
-      const now = Date.now();
-      const environments = new Set<string>();
-      const snapshots = [
-        this.localShell(config, request),
-        ...(Array.isArray(config.sshConnections) && config.sshConnections.length <= 8
-          ? config.sshConnections.map(async (value) => {
+      if (generation !== this.generation || !this.demanded) return;
+      const desired = new Map<string, { identity: string; read: Environment["read"] }>();
+      try {
+        const runtime = await this.localRuntime(config);
+        desired.set("", {
+          identity: JSON.stringify([runtime.origin, runtime.token, runtime.pid]),
+          read: async (request) => this.localShell(runtime, request),
+        });
+      } catch {
+        desired.set("", {
+          identity: "unavailable",
+          read: async () => {
+            throw new Error("Local runtime unavailable");
+          },
+        });
+      }
+      if (generation !== this.generation || !this.demanded) return;
+      let configurationFailed = false;
+      if (config.sshConnections !== undefined) {
+        if (!Array.isArray(config.sshConnections) || config.sshConnections.length > 8) configurationFailed = true;
+        else
+          for (const value of config.sshConnections) {
+            try {
               const connection = validateSshConnection(value);
-              if (environments.has(connection.environmentId)) throw new Error("Duplicate T3 environment");
-              environments.add(connection.environmentId);
-              const shell = object(await t3SshRequest(connection.host, connection, request.signal));
-              return { shell, namespace: `ssh:${connection.environmentId}:` };
-            })
-          : config.sshConnections === undefined
-            ? []
-            : [Promise.reject(new Error("Invalid SSH connections"))]),
-      ];
-      const results = await Promise.allSettled(
-        snapshots.map(async (snapshot) => {
-          const { shell, namespace } = await snapshot;
-          if (
-            !Number.isSafeInteger(shell.schemaVersion) ||
-            !Array.isArray(shell.threads) ||
-            shell.threads.length > 10_000
-          )
-            throw new Error("Unsupported shell");
-          return shell.threads.flatMap((value, index) => {
-            const slot = this.taskSlot(object(value), index, Date.now(), namespace);
-            return slot ? [slot] : [];
-          });
-        }),
-      );
-      const slots = results.flatMap((result) => {
-        if (result.status === "rejected") return [];
-        return result.value;
-      });
-      if (generation !== this.generation || request.signal.aborted) return;
-      this.slots = slots;
-      const present = new Set(slots.map((slot) => slot.threadKey));
-      for (const [id, at] of this.acknowledged)
-        if (!present.has(id) && now - at > TERMINAL_WINDOW_MS) this.acknowledged.delete(id);
-      this.health = results.some((result) => result.status === "rejected")
-        ? { state: "degraded", reason: "native-signals-unavailable", changedAt: now }
-        : { state: "ready", changedAt: now };
+              const namespace = `ssh:${connection.environmentId}:`;
+              if (desired.has(namespace)) throw new Error("Duplicate T3 environment");
+              desired.set(namespace, {
+                identity: JSON.stringify([connection.host, connection.environmentId, connection.token]),
+                read: async (request) => object(await t3SshRequest(connection.host, connection, request.signal)),
+              });
+            } catch {
+              configurationFailed = true;
+            }
+          }
+      }
+      let changed = this.configurationFailed !== configurationFailed;
+      this.configurationFailed = configurationFailed;
+      for (const [namespace, environment] of this.environments) {
+        if (desired.get(namespace)?.identity === environment.identity) continue;
+        environment.request?.abort();
+        this.environments.delete(namespace);
+        changed = true;
+      }
+      for (const [namespace, candidate] of desired) {
+        if (this.environments.has(namespace)) continue;
+        this.environments.set(namespace, { namespace, ...candidate, slots: [], state: "connecting" });
+        changed = true;
+      }
+      if (changed) this.publish();
+      for (const environment of this.environments.values()) this.collect(environment, generation);
     } catch {
-      if (generation !== this.generation || (request.signal.aborted && this.request !== request)) return;
+      if (generation !== this.generation || !this.demanded) return;
       const wasDegraded = this.health.state === "degraded";
-      this.slots = [];
-      this.health = { state: "degraded", reason: "native-signals-unavailable", changedAt: Date.now() };
+      this.resetEnvironments();
+      this.configurationFailed = true;
+      this.publish();
       if (!wasDegraded) this.log("T3 Code task source unavailable; check the local connection.");
-    } finally {
-      if (this.request === request) this.request = undefined;
     }
   }
 
-  private async localShell(
-    config: RecordValue,
-    request: AbortController,
-  ): Promise<{ shell: RecordValue; namespace: string }> {
+  private collect(environment: Environment, generation: number): void {
+    if (environment.pending) return;
+    const request = new AbortController();
+    environment.request = request;
+    const current = () =>
+      generation === this.generation &&
+      this.demanded &&
+      this.environments.get(environment.namespace) === environment &&
+      !request.signal.aborted;
+    const pending = (async () => {
+      try {
+        const shell = await environment.read(request);
+        if (
+          !Number.isSafeInteger(shell.schemaVersion) ||
+          !Array.isArray(shell.threads) ||
+          shell.threads.length > 10_000
+        )
+          throw new Error("Unsupported shell");
+        const observedAt = Date.now();
+        const candidate = shell.threads.flatMap((value, index) => {
+          const slot = this.taskSlot(object(value), index, observedAt, environment.namespace);
+          return slot ? [slot] : [];
+        });
+        if (!current()) return;
+        // Recheck the exact acknowledgement at commit, including the environment namespace.
+        environment.slots = candidate.filter(
+          (slot) =>
+            (slot.status !== "unread" && slot.status !== "error") ||
+            this.acknowledged.get(slot.threadKey!) !== slot.activityAt,
+        );
+        environment.state = "ready";
+        this.publish();
+      } catch {
+        if (!current()) return;
+        environment.slots = [];
+        environment.state = "degraded";
+        this.publish();
+      }
+    })().finally(() => {
+      if (environment.pending === pending) {
+        environment.pending = undefined;
+        environment.request = undefined;
+      }
+    });
+    environment.pending = pending;
+  }
+
+  private resetEnvironments(): void {
+    for (const environment of this.environments.values()) environment.request?.abort();
+    this.environments.clear();
+  }
+
+  private publish(): void {
+    this.slots = [...this.environments.values()].flatMap((environment) => environment.slots);
+    const present = new Set(this.slots.map((slot) => slot.threadKey));
+    const now = Date.now();
+    for (const [id, at] of this.acknowledged)
+      if (!present.has(id) && now - at > TERMINAL_WINDOW_MS) this.acknowledged.delete(id);
+    const environments = [...this.environments.values()];
+    const state =
+      this.configurationFailed || environments.some((environment) => environment.state === "degraded")
+        ? "degraded"
+        : !environments.length || environments.some((environment) => environment.state === "connecting")
+          ? "connecting"
+          : "ready";
+    if (this.health.state !== state) {
+      this.health =
+        state === "ready"
+          ? { state, changedAt: now }
+          : {
+              state,
+              reason: state === "connecting" ? "awaiting-snapshot" : "native-signals-unavailable",
+              changedAt: now,
+            };
+    }
+    for (const listener of this.listeners) listener();
+  }
+
+  private async localRuntime(config: RecordValue): Promise<LocalRuntime> {
     const origin = loopbackOrigin(config.origin);
     const token = config.token;
     if (typeof token !== "string" || !/^[A-Za-z0-9._~+/-]{1,8192}={0,2}$/u.test(token))
@@ -132,6 +243,11 @@ export class T3CodeSource {
     )
       throw new Error("Invalid runtime");
     process.kill(Number(runtime.pid), 0);
+    return { origin, token, pid: Number(runtime.pid) };
+  }
+
+  private async localShell(runtime: LocalRuntime, request: AbortController): Promise<RecordValue> {
+    const { origin, token } = runtime;
     const response = await fetch(`${origin}/api/orchestration/shell`, {
       headers: { authorization: `Bearer ${token}`, "x-t3-orchestration-protocol": "2" },
       redirect: "error",
@@ -148,7 +264,7 @@ export class T3CodeSource {
       chunks.push(chunk);
     }
     const shell = object(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-    return { shell, namespace: "" };
+    return shell;
   }
 
   async open(assignment: RoutedAgentSlot, signal: AbortSignal): Promise<boolean> {
@@ -160,7 +276,9 @@ export class T3CodeSource {
     if (!current || current.activityAt !== assignment.activityAt || current.status !== assignment.status) return false;
     if ((current.status === "unread" || current.status === "error") && current.activityAt !== undefined) {
       this.acknowledged.set(current.threadKey!, current.activityAt);
-      this.slots = this.slots.filter((slot) => slot !== current);
+      for (const environment of this.environments.values())
+        environment.slots = environment.slots.filter((slot) => slot !== current);
+      this.publish();
     }
     return true;
   }

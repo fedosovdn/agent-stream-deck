@@ -683,3 +683,171 @@ function snapshotFor(threadId: string, selected: boolean): MicroSnapshot {
   value.slots[0] = { ...value.slots[0]!, threadKey: `local:${threadId}`, selected };
   return value;
 }
+
+test("fork retains committed acknowledgements, work starts and parsed tails without sharing mutable maps", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "deck-ownership-fork-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  context.after(syncBuiltinESMExports);
+  const thread = "10000000-0000-4000-8000-000000000002";
+  const path = join(root, `rollout-now-${thread}.jsonl`);
+  const now = Date.now();
+  const started = now - 1_000;
+  await writeFile(
+    path,
+    JSON.stringify({
+      timestamp: new Date(started).toISOString(),
+      type: "event_msg",
+      payload: { type: "user_message" },
+    }) +
+      "\n" +
+      JSON.stringify({
+        timestamp: new Date(now).toISOString(),
+        type: "event_msg",
+        payload: { type: "task_complete" },
+      }) +
+      "\n",
+  );
+  let opens = 0;
+  const original = fs.open;
+  context.mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+    opens++;
+    return original(...args);
+  }) as typeof fs.open);
+  syncBuiltinESMExports();
+  const index = new CodexSessionOwnershipIndex([root], 0);
+  await index.annotate(snapshotFor(thread, false), now);
+  const unacknowledged = index.fork();
+  index.markOpened(thread);
+  const sibling = await unacknowledged.annotate(snapshotFor(thread, false), now + 1);
+  assert.equal(
+    sibling.hostSessions?.find((item) => item.threadId === thread)?.status,
+    "complete",
+    "late old acknowledgements do not mutate a fork",
+  );
+  const retained = index.fork();
+  const result = await retained.annotate(snapshotFor(thread, false), now + 2);
+  assert.equal(result.hostSessions?.find((item) => item.threadId === thread)?.status, "idle");
+  assert.equal(result.hostSessions?.find((item) => item.threadId === thread)?.workStartedAt, started);
+  assert.equal(opens, 1, "unchanged tail is cached across both forks and rescans");
+  await appendFile(
+    path,
+    "x".repeat(520 * 1024) +
+      "\n" +
+      JSON.stringify({
+        timestamp: new Date(now + 3).toISOString(),
+        type: "response_item",
+        payload: { type: "reasoning" },
+      }) +
+      "\n",
+  );
+  const rollover = await retained.annotate(snapshotFor(thread, false), now + 4);
+  assert.equal(rollover.hostSessions?.find((item) => item.threadId === thread)?.workStartedAt, started);
+  assert.equal(rollover.hostSessions?.find((item) => item.threadId === thread)?.workStartRevision, 0);
+});
+
+test("fork during a newly discovered rollout read inherits only committed ownership and cached metadata", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "deck-ownership-pending-fork-"));
+  const committed = "10000000-0000-4000-8000-000000000002";
+  const discovered = "10000000-0000-4000-8000-000000000003";
+  const committedPath = join(root, `rollout-now-${committed}.jsonl`);
+  const discoveredPath = join(root, `rollout-now-${discovered}.jsonl`);
+  const now = Date.now();
+  const started = now - 1_000;
+  await writeFile(
+    committedPath,
+    JSON.stringify({
+      timestamp: new Date(started).toISOString(),
+      type: "event_msg",
+      payload: { type: "user_message" },
+    }) +
+      "\n" +
+      JSON.stringify({
+        timestamp: new Date(now).toISOString(),
+        type: "event_msg",
+        payload: { type: "task_complete" },
+      }) +
+      "\n",
+  );
+  let releaseRead!: () => void;
+  const held = new Promise<void>((resolve) => {
+    releaseRead = resolve;
+  });
+  let readReached!: () => void;
+  const reading = new Promise<void>((resolve) => {
+    readReached = resolve;
+  });
+  let committedReads = 0;
+  const originalOpen = fs.open;
+  const mockedOpen = context.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    const originalRead = handle.read.bind(handle);
+    context.mock.method(handle, "read", async (...values: Parameters<typeof handle.read>) => {
+      if (String(args[0]) === committedPath) committedReads++;
+      if (String(args[0]) === discoveredPath) {
+        readReached();
+        await held;
+      }
+      return originalRead(...values);
+    });
+    return handle;
+  });
+  syncBuiltinESMExports();
+  let pending: Promise<MicroSnapshot> | undefined;
+  context.after(async () => {
+    releaseRead();
+    await pending;
+    mockedOpen.mock.restore();
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true, force: true });
+  });
+  const index = new CodexSessionOwnershipIndex([root], 60_000);
+  await index.annotate(snapshotFor(committed, true), now);
+  await writeFile(discoveredPath, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+  pending = index.annotate(snapshotFor(discovered, false), now + 1);
+  await reading;
+  const fork = index.fork();
+  const value = snapshotFor(committed, false);
+  // An idle catalog candidate asks for ownership without forcing a new scan.
+  value.activeCatalog = {
+    complete: true,
+    candidates: [
+      {
+        threadKey: `local:${discovered}`,
+        conversationId: discovered,
+        title: "Discovered but uncommitted",
+        status: "idle",
+        selected: false,
+        catalogIndex: 0,
+      },
+    ],
+  };
+  const inherited = await fork.annotate(value, now + 2);
+  assert.equal(
+    inherited.activeCatalog?.candidates[0]?.ownedByHost,
+    false,
+    "a discovered filename cannot become owned before its metadata read commits",
+  );
+  assert.equal(inherited.slots[0]?.ownedByHost, true);
+  const session = inherited.hostSessions?.find((item) => item.threadId === committed);
+  assert.equal(session?.status, "idle", "the exact committed completion remains acknowledged");
+  assert.equal(session?.workStartedAt, started);
+  assert.equal(session?.workStartRevision, 0);
+  assert.equal(
+    inherited.hostSessions?.some((item) => item.threadId === discovered),
+    false,
+  );
+  releaseRead();
+  assert.equal((await pending).slots[0]?.ownedByHost, true, "the retired index finishes its own discovered session");
+  assert.deepEqual(
+    await fork.annotate(value, now + 3),
+    inherited,
+    "late file reads cannot alter the fork's committed observations",
+  );
+  await rm(discoveredPath);
+  const rescanned = await fork.annotate(value, now + 60_001);
+  assert.equal(rescanned.hostSessions?.find((item) => item.threadId === committed)?.status, "idle");
+  assert.equal(rescanned.hostSessions?.find((item) => item.threadId === committed)?.workStartedAt, started);
+  assert.equal(rescanned.hostSessions?.find((item) => item.threadId === committed)?.workStartRevision, 0);
+  assert.equal(rescanned.activeCatalog?.candidates[0]?.ownedByHost, false);
+  assert.equal(committedReads, 1, "the fork reuses the fully committed successful tail after a real rescan");
+});

@@ -100,6 +100,41 @@ content-free labels, normalized state, and bounded timestamps. It does not open
 OpenCode SQLite, invoke WSL, launch a stopped service, or expose connection and
 task content.
 
+Sources publish completed environment snapshots independently. OpenCode owns
+its five-second discovery/collection cadence and admits at most 17 local and SSH
+connections, with at most three collections and two SSH discoveries in flight.
+One collection place prefers a waiting local job; the other places use FIFO.
+Remote jobs can borrow all three places when no local job is waiting, and an
+already running job is not preempted. Failed SSH discovery diagnostics may
+remain outside the admitted 17. A single request timeout does not bound the
+duration of a complete collection or its admission wait.
+
+The controller's existing 1200-ms clock independently triggers Codex, local
+quota and T3 work. T3 owns configuration reconciliation and a non-overlapping
+job for each of its local and up to eight SSH environments; it does not add a
+second clock at the same period. Pending work in one owner does not postpone
+another owner's next trigger. Ready source notifications carry no connection
+material, and queue projection consumes only committed snapshots. Pending
+environments keep their last observation time; a successful empty response
+clears only that environment, and a T3 failure removes only its stale tasks.
+
+One serial SDK consumer coalesces display revisions and catches up after a slow
+write without requiring another source event. Controller generation and the
+registered action instance are checked before each new write; failed writes are
+not cached as delivered. A press keeps the assignment captured at key-down even
+when independent source arrivals subsequently change the queue. First arrival
+can change the initial order of tasks with unknown start times; the queue's
+identity, priority and completion-retention rules are unchanged.
+
+Closing the Codex bridge retires pending discovery, connection and annotation
+work. A late retired result cannot replace a fresh socket, clear its connecting
+promise or publish its snapshot. The new ownership-index generation retains
+committed completion acknowledgements, work-start records and parsed metadata;
+pending annotations continue only in the retired index. Renderer discovery,
+input expressions, authentication boundaries and their timeout budgets remain
+the characterized contract above. This lifecycle change has local fixture
+coverage and does not claim a newer live renderer compatibility result.
+
 ### Active queue projection
 
 `Active queue` is a plugin display option shared by all six Agent actions on one

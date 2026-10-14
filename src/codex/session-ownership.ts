@@ -37,6 +37,25 @@ export class CodexSessionOwnershipIndex {
     private readonly refreshIntervalMs = 5_000,
   ) {}
 
+  /** Retire in-flight work while retaining this process's committed observations. */
+  fork(): CodexSessionOwnershipIndex {
+    const next = new CodexSessionOwnershipIndex([...this.roots], this.refreshIntervalMs);
+    next.sessionIds = new Set(this.sessionIds);
+    next.recentSessions = this.recentSessions.map((session) => ({ ...session }));
+    next.trackedSessionPresence = new Map(
+      [...this.trackedSessionPresence].map(([id, session]) => [id, { ...session }]),
+    );
+    next.acknowledgedCompletions = new Map(this.acknowledgedCompletions);
+    next.contextParsedSessions = new Set(this.contextParsedSessions);
+    next.attemptedContextSessions = new Set(this.attemptedContextSessions);
+    next.retainedWorkStarts = new Map([...this.retainedWorkStarts].map(([id, record]) => [id, { ...record }]));
+    next.parsedSessionStatuses = new Map(
+      [...this.parsedSessionStatuses].map(([path, entry]) => [path, { ...entry, status: { ...entry.status } }]),
+    );
+    next.refreshedAt = this.refreshedAt;
+    return next;
+  }
+
   async annotate(snapshot: MicroSnapshot, now = Date.now()): Promise<MicroSnapshot> {
     const trackedSessions = new Set(
       snapshot.slots
@@ -167,7 +186,6 @@ export class CodexSessionOwnershipIndex {
       );
       files.push(...resolved.filter((value): value is NonNullable<typeof value> => value != null));
     }
-    this.sessionIds = next;
     const uniqueRecent = new Map<string, (typeof files)[number]>();
     for (const file of files.sort((left, right) => right.activityAt - left.activityAt)) {
       if (!uniqueRecent.has(file.threadId)) uniqueRecent.set(file.threadId, file);
@@ -181,6 +199,7 @@ export class CodexSessionOwnershipIndex {
     const filesToRead = [...recent, ...trackedExtra];
     const contextParsed = new Set<string>();
     const nextParsedStatuses = new Map<string, CachedSessionStatus>();
+    const retainedWorkStarts = new Map(this.retainedWorkStarts);
     const presence = await Promise.all(
       filesToRead.map(async ({ threadId, path, activityAt: fileActivityAt, signature }) => {
         const shouldRead = now - fileActivityAt <= 15 * 60_000 || trackedSessions.has(threadId);
@@ -200,16 +219,18 @@ export class CodexSessionOwnershipIndex {
         if (shouldRead) contextParsed.add(threadId);
         const { activityAt, ...status } = recentStatus;
         const observedWorkStart = workStartFields(recentStatus);
-        const prior = this.retainedWorkStarts.get(threadId);
+        const prior = retainedWorkStarts.get(threadId);
         if (observedWorkStart && (prior == null || observedWorkStart.workStartRevision >= prior.workStartRevision)) {
-          this.retainedWorkStarts.set(threadId, { ...observedWorkStart, lastSeenAt: now });
+          retainedWorkStarts.set(threadId, { ...observedWorkStart, lastSeenAt: now });
         }
-        const retained = this.retainedWorkStarts.get(threadId);
+        const retained = retainedWorkStarts.get(threadId);
         const workStart =
           retained && now - retained.lastSeenAt <= WORK_START_RETENTION_MS ? workStartFields(retained) : null;
         return { threadId, activityAt: activityAt ?? fileActivityAt, ...status, ...(workStart ?? {}) };
       }),
     );
+    this.sessionIds = next;
+    this.retainedWorkStarts = retainedWorkStarts;
     this.trackedSessionPresence = new Map(presence.map((session) => [session.threadId, session]));
     this.parsedSessionStatuses = nextParsedStatuses;
     this.recentSessions = recent.map((file) => this.trackedSessionPresence.get(file.threadId)!);

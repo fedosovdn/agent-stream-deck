@@ -439,27 +439,34 @@ export class CodexMicroRendererBridge {
     { resolve: (value: CdpResponse) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
   >();
   private connecting?: Promise<void>;
+  private connectionAbort?: AbortController;
+  private generation = 0;
   private lastSnapshot?: MicroSnapshot;
   private readonly agentPresses = new WeakMap<AbortSignal, AgentDispatchPlan>();
-  private readonly sessionOwnership = new CodexSessionOwnershipIndex();
+  private sessionOwnership = new CodexSessionOwnershipIndex();
   private readonly evaluationNamespace = randomUUID();
 
   constructor(private readonly log: (message: string) => void) {}
 
   async refresh(): Promise<MicroSnapshot> {
+    const generation = this.generation;
     try {
       await this.ensureConnected();
+      this.checkGeneration(generation);
       const nativeSnapshot = await this.evaluate<MicroSnapshot>(SNAPSHOT_EXPRESSION);
+      this.checkGeneration(generation);
       const snapshot = await this.sessionOwnership.annotate(nativeSnapshot);
+      this.checkGeneration(generation);
       this.lastSnapshot = snapshot;
       return snapshot;
     } catch (error) {
-      this.disconnect();
+      if (generation === this.generation) this.disconnect();
       throw error;
     }
   }
 
   async sendAgent(slot: number, act: 0 | 1, expectedThreadKey?: string, signal?: AbortSignal): Promise<void> {
+    const generation = this.generation;
     if (!Number.isInteger(slot) || slot < 0 || slot > 5) throw new Error(`Ungültiger Micro-Agent-Slot: ${slot}`);
     if (act === 0 && signal) {
       const pressed = this.agentPresses.get(signal);
@@ -475,6 +482,7 @@ export class CodexMicroRendererBridge {
       return;
     }
     const snapshot = act === 1 ? await this.refresh() : (this.lastSnapshot ?? (await this.refresh()));
+    this.checkGeneration(generation);
     if (signal?.aborted) return;
     const plan = resolveAgentDispatch(snapshot, slot, expectedThreadKey);
     if (plan.kind === "native") {
@@ -488,6 +496,7 @@ export class CodexMicroRendererBridge {
         },
         "codex-micro-hid-event",
       );
+      this.checkGeneration(generation);
       if (act === 0) return;
       if (signal) this.agentPresses.set(signal, plan);
     } else {
@@ -500,6 +509,7 @@ export class CodexMicroRendererBridge {
         },
         "codex-micro-hid-event",
       );
+      this.checkGeneration(generation);
       const conversationId = snapshot.activeCatalog?.candidates.find(
         (candidate) => candidate.threadKey === plan.threadKey,
       )?.conversationId;
@@ -507,6 +517,7 @@ export class CodexMicroRendererBridge {
       return;
     }
     await this.ensureThreadActivated(plan.threadKey);
+    this.checkGeneration(generation);
     const conversationId = snapshot.activeCatalog?.candidates.find(
       (candidate) => candidate.threadKey === plan.threadKey,
     )?.conversationId;
@@ -563,13 +574,16 @@ export class CodexMicroRendererBridge {
   }
 
   async runKeycap(keycapId: OfficialKeycapId): Promise<void> {
+    const generation = this.generation;
     if (!OFFICIAL_KEYCAP_IDS.includes(keycapId)) throw new Error(`Unknown Codex Micro keycap: ${keycapId}`);
     if (keycapId === "MIC") {
       await this.sendAction("ACT10_ACT11", 1);
+      this.checkGeneration(generation);
       await this.sendAction("ACT10_ACT11", 0);
       return;
     }
     await this.ensureConnected();
+    this.checkGeneration(generation);
     const expression = `(async () => {
       const urls = [...new Set([
         ...[...document.querySelectorAll('link[href], script[src]')].map((element) => element.href || element.src),
@@ -638,18 +652,31 @@ export class CodexMicroRendererBridge {
     })()`;
     try {
       await this.evaluate(expression);
+      this.checkGeneration(generation);
     } catch (error) {
-      this.disconnect();
+      if (generation === this.generation) this.disconnect();
       throw error;
     }
   }
 
   close(): void {
+    this.generation++;
+    this.connectionAbort?.abort();
+    this.connectionAbort = undefined;
+    this.connecting = undefined;
+    this.lastSnapshot = undefined;
+    this.sessionOwnership = this.sessionOwnership.fork();
     this.disconnect();
   }
 
+  private checkGeneration(generation: number): void {
+    if (generation !== this.generation) throw new Error("Codex bridge generation was retired.");
+  }
+
   private async dispatch(type: string, payload: object, requiredHandler: string): Promise<void> {
+    const generation = this.generation;
     await this.ensureConnected();
+    this.checkGeneration(generation);
     const message = { type, ...payload };
     const expression = `(async () => {
       const urls = [...new Set([
@@ -679,8 +706,9 @@ export class CodexMicroRendererBridge {
     })()`;
     try {
       await this.evaluate(expression);
+      this.checkGeneration(generation);
     } catch (error) {
-      this.disconnect();
+      if (generation === this.generation) this.disconnect();
       throw error;
     }
   }
@@ -688,17 +716,23 @@ export class CodexMicroRendererBridge {
   private async ensureConnected(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return;
     if (this.connecting) return this.connecting;
-    this.connecting = this.connect();
+    const abort = new AbortController();
+    const pending = this.connect(this.generation, abort.signal);
+    this.connectionAbort = abort;
+    this.connecting = pending;
     try {
-      await this.connecting;
+      await pending;
     } finally {
-      this.connecting = undefined;
+      if (this.connecting === pending) this.connecting = undefined;
+      if (this.connectionAbort === abort) this.connectionAbort = undefined;
     }
   }
 
-  private async connect(): Promise<void> {
-    const port = await discoverDebugPort();
-    const targets = await fetchJson<DebugTarget[]>(`http://127.0.0.1:${port}/json/list`);
+  private async connect(generation: number, signal: AbortSignal): Promise<void> {
+    const port = await discoverDebugPort(signal);
+    this.checkGeneration(generation);
+    const targets = await fetchJson<DebugTarget[]>(`http://127.0.0.1:${port}/json/list`, signal);
+    this.checkGeneration(generation);
     const target = selectCodexMainTarget(targets);
     if (!target?.webSocketDebuggerUrl) throw new Error("Kein Codex-Hauptfenster mit Debug-Brücke gefunden.");
 
@@ -709,6 +743,7 @@ export class CodexMicroRendererBridge {
         socket.removeListener("open", opened);
         socket.removeListener("error", failed);
         socket.removeListener("close", closed);
+        signal.removeEventListener("abort", aborted);
       };
       const opened = () => {
         cleanup();
@@ -722,11 +757,18 @@ export class CodexMicroRendererBridge {
         reject(error);
       };
       const closed = () => failed(new Error("Codex closed the bridge during connection."));
+      const aborted = () => failed(new Error("Codex bridge generation was retired."));
       const timer = setTimeout(() => failed(new Error("Zeitüberschreitung beim Verbinden mit Codex.")), 3000);
       socket.once("open", opened);
       socket.once("error", failed);
       socket.once("close", closed);
+      signal.addEventListener("abort", aborted, { once: true });
+      if (signal.aborted) aborted();
     });
+    if (generation !== this.generation) {
+      socket.terminate();
+      this.checkGeneration(generation);
+    }
     socket.on("message", (raw) => this.handleMessage(String(raw)));
     socket.on("close", () => this.disconnect(socket));
     socket.on("error", () => this.disconnect(socket));
@@ -849,25 +891,28 @@ export function retainEvaluationPromise(expression: string, id: string | number)
   })()`;
 }
 
-async function discoverDebugPort(): Promise<number> {
+async function discoverDebugPort(signal: AbortSignal): Promise<number> {
   if (process.platform === "darwin") {
     const fromFile = await readPortFile();
-    if (fromFile && (await isDebugPort(fromFile))) return fromFile;
+    if (fromFile && (await isDebugPort(fromFile, signal))) return fromFile;
+    signal.throwIfAborted();
     const executablePath = await readMacCodexExecutablePath();
+    signal.throwIfAborted();
     if (executablePath === null) throw new CodexNotRunningError();
     if (executablePath === undefined) throw new Error("Codex launcher state is unavailable.");
-    const { stdout } = await execFileAsync("/bin/ps", ["-axo", "command="], { timeout: 4000 });
+    const { stdout } = await execFileAsync("/bin/ps", ["-axo", "command="], { timeout: 4000, signal });
     const commands = stdout.split("\n");
     for (const line of commands) {
       if (!hasMacCodexExecutable([line], executablePath) || !line.includes("--remote-debugging-address=127.0.0.1"))
         continue;
       const port = Number.parseInt(line.match(/--remote-debugging-port(?:=|\s+)(\d+)/)?.[1] ?? "", 10);
-      if (Number.isInteger(port) && (await isDebugPort(port))) return port;
+      if (Number.isInteger(port) && (await isDebugPort(port, signal))) return port;
     }
     throw new Error("Codex wurde nicht über den macOS-Micro-Aktivierungsstarter geöffnet.");
   }
   const fromFile = await readPortFile();
-  if (fromFile && (await isDebugPort(fromFile))) return fromFile;
+  if (fromFile && (await isDebugPort(fromFile, signal))) return fromFile;
+  signal.throwIfAborted();
   if (process.platform !== "win32")
     throw new Error("Die native Codex-Micro-Brücke wird auf dieser Plattform nicht unterstützt.");
 
@@ -876,12 +921,13 @@ async function discoverDebugPort(): Promise<number> {
   const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
     windowsHide: true,
     timeout: 4000,
+    signal,
   });
   const values = stdout.split(/\s+/);
   if (values.includes("__CODEX_DECK_NOT_RUNNING__")) throw new CodexNotRunningError();
   for (const value of values) {
     const port = Number.parseInt(value, 10);
-    if (Number.isInteger(port) && (await isDebugPort(port))) return port;
+    if (Number.isInteger(port) && (await isDebugPort(port, signal))) return port;
   }
   throw new Error("Codex wurde nicht über den Micro-Aktivierungsstarter geöffnet.");
 }
@@ -904,17 +950,19 @@ async function readMacCodexExecutablePath(): Promise<string | null | undefined> 
   }
 }
 
-async function isDebugPort(port: number): Promise<boolean> {
+async function isDebugPort(port: number, signal: AbortSignal): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(750) });
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(750)]),
+    });
     return response.ok;
   } catch {
     return false;
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
+async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
+  const response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(1500)]) });
   if (!response.ok) throw new Error(`Codex-Debug-Endpunkt antwortete mit ${response.status}.`);
   return (await response.json()) as T;
 }

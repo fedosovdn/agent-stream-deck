@@ -82,6 +82,22 @@ T3 keys display `T3` and have no Codex context ring.
 Missing credentials, unsupported response shapes, HTTP/SSH failure, excessive
 response size or timeouts produce degraded health and clear stale tasks from the
 failing connection while retaining successful environments.
+Each environment commits its full verified snapshot independently; pending
+requests preserve the previous snapshot's observation time. A shared 1200-ms
+controller clock triggers the source without waiting for Codex, quota or SDK
+work. The source reconciles configuration and starts only idle environment jobs,
+with the existing local-plus-eight-SSH capacity. It does not add another clock
+or abort a remote request when a local poll starts. Health remains connecting
+until required first responses arrive, degrades on a known failure, and becomes
+ready when all required environments have responded successfully; ready tasks
+are available during the intermediate state.
+
+Changing credentials, environment identity or local runtime generation retires
+only the affected job. An invalid private configuration clears all jobs as
+before. Exact terminal acknowledgements are checked again at commit, so a
+pending response cannot restore an acknowledged revision. These changes are
+covered by local fixtures; they do not establish a new live T3/Fedora or physical
+device compatibility result.
 HTTP requests have a four-second budget and a two-MiB response limit.
 SSH polling has a four-second total budget (pairing setup allows ten seconds) and the same two-MiB output limit.
 Acknowledgements are process-local and are never distributed or persisted.

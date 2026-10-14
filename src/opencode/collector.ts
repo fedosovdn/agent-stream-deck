@@ -51,6 +51,28 @@ import {
 } from "./ssh.js";
 import { mapConcurrent, unavailable } from "./collection-utils.js";
 
+type Environment = {
+  connectionId: string;
+  generation: number;
+  local: boolean;
+  connection?: Connection;
+  server?: SshServer;
+  target?: string;
+  client: AuthenticatedOpenCodeClient;
+  pending?: Promise<void>;
+};
+type Work = {
+  environment: Environment;
+  run(): Promise<void>;
+  finish(): void;
+};
+type ConnectionCandidate = {
+  rootSessions: RawSession[];
+  attentionRoots: Set<string>;
+  activeRoots: Set<string>;
+  complete: boolean;
+};
+
 function defaultDependencies(): OpenCodeCollectorDependencies {
   const home = homedir();
   return {
@@ -75,15 +97,24 @@ export class OpenCodeCollector {
   private readonly secret: Buffer;
   private readonly deps: OpenCodeCollectorDependencies;
   private readonly state = new OpenCodeTaskState();
-  private readonly tunnels = new Map<string, Connection>();
-  private readonly connections = new Map<string, Connection>();
-  private readonly children = new Set<OpenCodeProcess>();
+  private readonly local = new Map<string, Environment>();
+  private readonly remote = new Map<string, Environment>();
+  private readonly snapshots = new Map<string, OpenCodeConnectionSnapshot>();
+  private readonly children = new Map<OpenCodeProcess, Environment>();
+  private readonly terminating = new Map<Promise<void>, number>();
+  private readonly listeners = new Set<() => void>();
   private readonly client: AuthenticatedOpenCodeClient;
+  private readonly collectionQueue: Work[] = [];
+  private readonly discoveryQueue: Work[] = [];
+  private collections = 0;
+  private discoveries = 0;
+  private localReserve = false;
   private interval?: NodeJS.Timeout;
   private running = false;
   private orphansReaped = false;
   private generation = 0;
-  private inFlight?: Promise<OpenCodeCollectorSnapshot>;
+  private localDiscovery?: Promise<Environment[]>;
+  private sshDiscovery?: Promise<Environment[]>;
   private current: OpenCodeCollectorSnapshot = { version: 1, observedAt: 0, connections: [] };
 
   constructor(options: { identitySecret: string | Uint8Array; dependencies?: Partial<OpenCodeCollectorDependencies> }) {
@@ -94,26 +125,50 @@ export class OpenCodeCollector {
   }
 
   async start(): Promise<OpenCodeCollectorSnapshot> {
-    if (this.running) return this.refresh();
-    this.running = true;
-    this.generation++;
-    const snapshot = await this.refresh();
-    if (this.running) {
+    if (!this.running) {
+      this.running = true;
+      this.generation++;
+      this.current = { version: 1, observedAt: 0, connections: [] };
+      // One cadence, independent work: neither a slow discovery nor a slow collection owns this timer.
       this.interval = this.deps.setInterval(() => {
-        void this.refresh().catch(() => undefined);
+        void this.poll().catch(() => undefined);
       }, POLL_INTERVAL_MS);
+      void this.poll().catch(() => undefined);
     }
-    return snapshot;
+    return this.current;
   }
 
-  refresh(): Promise<OpenCodeCollectorSnapshot> {
-    if (!this.running) return Promise.reject(new Error("OpenCode collector is not started."));
-    if (this.inFlight) return this.inFlight;
+  async refresh(): Promise<OpenCodeCollectorSnapshot> {
+    if (!this.running) throw new Error("OpenCode collector is not started.");
+    await Promise.all(await this.poll());
+    return this.current;
+  }
+
+  private async poll(): Promise<Promise<void>[]> {
     const generation = this.generation;
-    this.inFlight = this.collect(generation).finally(() => {
-      this.inFlight = undefined;
-    });
-    return this.inFlight;
+    const schedule = async (discovery: Promise<Environment[]>) => {
+      const environments = await discovery;
+      if (!this.running || generation !== this.generation) return [];
+      return environments.map((environment) => this.schedule(environment));
+    };
+    const work = await Promise.all([schedule(this.reconcileLocal()), schedule(this.reconcileSsh())]);
+    if (
+      this.running &&
+      generation === this.generation &&
+      this.local.size === 0 &&
+      this.remote.size === 0 &&
+      this.current.observedAt === 0
+    ) {
+      this.publish(this.deps.now());
+    }
+    return work.flat();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   snapshot(): OpenCodeCollectorSnapshot {
@@ -124,12 +179,14 @@ export class OpenCodeCollector {
     const acknowledged = this.state.acknowledgeTask(this.current, connectionId, sessionId, terminalAt);
     if (!acknowledged) return false;
     this.current = acknowledged;
+    for (const snapshot of acknowledged.connections) this.snapshots.set(snapshot.connectionId, snapshot);
+    this.notify();
     return true;
   }
 
   async publishTaskViewed(connectionId: string, sessionId: string): Promise<boolean> {
     const binding = this.state.acknowledgedRevision(connectionId, sessionId);
-    const connection = this.connections.get(connectionId);
+    const connection = (this.local.get(connectionId) ?? this.remote.get(connectionId))?.connection;
     if (!binding?.acknowledged || binding.idleAt === undefined || !connection) return false;
     try {
       const authorization = `Basic ${Buffer.from(`opencode:${connection.password}`).toString("base64")}`;
@@ -151,50 +208,291 @@ export class OpenCodeCollector {
   }
 
   async stop(): Promise<void> {
-    if (!this.running && this.tunnels.size === 0) return;
+    if (!this.running) return;
+    const generation = this.generation;
     this.running = false;
     this.generation++;
     if (this.interval) this.deps.clearInterval(this.interval);
     this.interval = undefined;
+    const environments = [...this.local.values(), ...this.remote.values()];
+    const pending = environments.flatMap((environment) => (environment.pending ? [environment.pending] : []));
+    const discoveries = [this.localDiscovery, this.sshDiscovery];
+    this.localDiscovery = undefined;
+    this.sshDiscovery = undefined;
+    this.local.clear();
+    this.remote.clear();
     this.client.stop();
-    this.tunnels.clear();
-    this.connections.clear();
-    await this.terminateChildren();
-    await this.inFlight?.catch(() => undefined);
-    await this.terminateChildren();
+    for (const environment of environments) this.retire(environment);
+    this.snapshots.clear();
+    await this.terminateChildren(generation);
+    await Promise.allSettled([...pending, ...discoveries]);
+    await this.terminateChildren(generation);
   }
 
-  private async collect(generation: number): Promise<OpenCodeCollectorSnapshot> {
-    const now = this.deps.now();
-    const local = await this.discoverLocal();
-    const ssh = await this.discoverSsh();
-    const discovered = [...local, ...ssh.connections].slice(0, MAX_CONNECTIONS);
-    const results = await mapConcurrent(discovered, 3, async (connection) => {
-      try {
-        return await this.collectConnection(connection, now);
-      } catch {
-        if (connection.tunnel) {
-          this.tunnels.delete(connection.connectionId);
-          await this.terminateChild(connection.tunnel);
-        }
-        return unavailable(connection.connectionId, now);
-      }
-    });
-    if (!this.running || generation !== this.generation) return this.current;
-    this.connections.clear();
-    for (const [index, connection] of discovered.entries()) {
-      const health = results[index]?.health;
-      if (health === "ready" || health === "capacity-exceeded") {
-        this.connections.set(connection.connectionId, connection);
+  private active(environment: Environment): boolean {
+    return (
+      this.running &&
+      environment.generation === this.generation &&
+      (environment.local ? this.local : this.remote).get(environment.connectionId) === environment
+    );
+  }
+
+  private admitted(): Environment[] {
+    return [...this.local.values(), ...[...this.remote.values()].filter((environment) => environment.connection)].slice(
+      0,
+      MAX_CONNECTIONS,
+    );
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) listener();
+  }
+
+  private publish(now: number): void {
+    const admitted = new Set(this.admitted().map((environment) => environment.connectionId));
+    const connections = [...this.snapshots.values()]
+      .filter(
+        (snapshot) =>
+          admitted.has(snapshot.connectionId) ||
+          (!this.remote.get(snapshot.connectionId)?.connection && this.remote.has(snapshot.connectionId)),
+      )
+      .sort((left, right) => left.connectionId.localeCompare(right.connectionId));
+    this.current = { version: 1, observedAt: now, connections };
+    this.notify();
+  }
+
+  private prunePublished(): void {
+    const allowed = new Set(this.admitted().map((environment) => environment.connectionId));
+    for (const environment of this.remote.values()) if (!environment.connection) allowed.add(environment.connectionId);
+    if (
+      this.current.connections.some(
+        (connection) => !allowed.has(connection.connectionId) || !this.snapshots.has(connection.connectionId),
+      )
+    ) {
+      this.publish(this.deps.now());
+    }
+  }
+
+  private retire(environment: Environment): void {
+    environment.client.stop();
+    for (const queue of [this.collectionQueue, this.discoveryQueue]) {
+      for (let index = queue.length - 1; index >= 0; index--) {
+        if (queue[index]!.environment !== environment) continue;
+        queue.splice(index, 1)[0]!.finish();
       }
     }
-    results.push(...ssh.failures.map((connectionId) => unavailable(connectionId, now)));
-    const deduplicated = [...new Map(results.map((result) => [result.connectionId, result])).values()].sort(
-      (left, right) => left.connectionId.localeCompare(right.connectionId),
-    );
-    this.state.label(deduplicated, now);
-    this.current = { version: 1, observedAt: now, connections: deduplicated };
-    return this.current;
+    for (const [child, owner] of this.children)
+      if (owner === environment) void this.terminateChild(child).catch(() => undefined);
+    this.snapshots.delete(environment.connectionId);
+  }
+
+  private reconcileLocal(): Promise<Environment[]> {
+    if (this.localDiscovery) return this.localDiscovery;
+    const generation = this.generation;
+    const discovery = this.discoverLocal()
+      .then((connections) => {
+        if (!this.running || generation !== this.generation) return [];
+        const next = new Map<string, Environment>();
+        for (const connection of connections) {
+          const existing = this.local.get(connection.connectionId);
+          if (existing?.connection === connection) next.set(connection.connectionId, existing);
+          else {
+            if (existing) this.retire(existing);
+            next.set(connection.connectionId, {
+              connectionId: connection.connectionId,
+              generation,
+              local: true,
+              connection,
+              client: new AuthenticatedOpenCodeClient(this.deps),
+            });
+          }
+        }
+        for (const environment of this.local.values())
+          if (!next.has(environment.connectionId)) this.retire(environment);
+        this.local.clear();
+        for (const [id, environment] of next) this.local.set(id, environment);
+        this.prunePublished();
+        return [...next.values()];
+      })
+      .finally(() => {
+        if (this.localDiscovery === discovery) this.localDiscovery = undefined;
+      });
+    this.localDiscovery = discovery;
+    return discovery;
+  }
+
+  private reconcileSsh(): Promise<Environment[]> {
+    if (this.sshDiscovery) return this.sshDiscovery;
+    const generation = this.generation;
+    const discovery = (async () => {
+      let servers: SshServer[];
+      try {
+        const bytes = await this.deps.files.readSecure(
+          this.deps.settingsPath,
+          SETTINGS_LIMIT,
+          this.deps.currentUid,
+          "owner-write",
+        );
+        servers = parseSshServers(bytes);
+      } catch {
+        // A failed read is not authority to remove a saved environment or its tunnel.
+        return generation === this.generation ? [...this.remote.values()] : [];
+      }
+      if (!this.running || generation !== this.generation) return [];
+      const next = new Map<string, Environment>();
+      for (const server of servers) {
+        const connectionId = this.opaqueId(`ssh\0${server.id}`);
+        let target: string;
+        try {
+          target = JSON.stringify(parseSshTarget(server.target));
+        } catch {
+          target = server.target;
+        }
+        const existing = this.remote.get(connectionId);
+        if (existing?.target === target) next.set(connectionId, existing);
+        else {
+          if (existing) this.retire(existing);
+          next.set(connectionId, {
+            connectionId,
+            generation,
+            local: false,
+            server,
+            target,
+            client: new AuthenticatedOpenCodeClient(this.deps),
+          });
+        }
+      }
+      for (const environment of this.remote.values()) if (!next.has(environment.connectionId)) this.retire(environment);
+      this.remote.clear();
+      for (const [id, environment] of next) this.remote.set(id, environment);
+      this.prunePublished();
+      if (!this.orphansReaped) {
+        const templates = this.tunnelTemplates(servers);
+        if (templates.length > 0) {
+          try {
+            await this.deps.reapOrphanedTunnels(templates);
+            if (this.running && generation === this.generation) this.orphansReaped = true;
+          } catch {
+            /* Retried on the next discovery. */
+          }
+        }
+      }
+      return this.running && generation === this.generation ? [...next.values()] : [];
+    })().finally(() => {
+      if (this.sshDiscovery === discovery) this.sshDiscovery = undefined;
+    });
+    this.sshDiscovery = discovery;
+    return discovery;
+  }
+
+  private enqueue(environment: Environment, discovery: boolean, run: () => Promise<void>): Promise<void> {
+    return new Promise((finish) => {
+      (discovery ? this.discoveryQueue : this.collectionQueue).push({ environment, run, finish });
+      this.drain();
+    });
+  }
+
+  private drain(): void {
+    while (this.discoveries < 2 && this.discoveryQueue.length > 0) {
+      const work = this.discoveryQueue.shift()!;
+      if (!this.active(work.environment)) {
+        work.finish();
+        continue;
+      }
+      this.discoveries++;
+      void work
+        .run()
+        .catch(() => undefined)
+        .finally(() => {
+          this.discoveries--;
+          work.finish();
+          this.drain();
+        });
+    }
+    while (this.collections < 3 && this.collectionQueue.length > 0) {
+      const localIndex = this.localReserve ? -1 : this.collectionQueue.findIndex((work) => work.environment.local);
+      const reserved = localIndex >= 0;
+      const work = this.collectionQueue.splice(reserved ? localIndex : 0, 1)[0]!;
+      if (!this.active(work.environment) || !this.admitted().includes(work.environment)) {
+        work.finish();
+        continue;
+      }
+      this.collections++;
+      if (reserved) this.localReserve = true;
+      void work
+        .run()
+        .catch(() => undefined)
+        .finally(() => {
+          this.collections--;
+          if (reserved) this.localReserve = false;
+          work.finish();
+          this.drain();
+        });
+    }
+  }
+
+  private schedule(environment: Environment): Promise<void> {
+    if (!this.active(environment)) return Promise.resolve();
+    if (environment.pending) return environment.pending;
+    const pending = (async () => {
+      if (!environment.connection && environment.server) {
+        await this.enqueue(environment, true, async () => {
+          try {
+            const connection = await this.openSsh(environment.server!, environment.connectionId, environment);
+            if (!this.active(environment)) {
+              if (connection.tunnel) await this.terminateChild(connection.tunnel);
+              return;
+            }
+            environment.connection = connection;
+          } catch {
+            if (!this.active(environment)) return;
+            this.snapshots.set(environment.connectionId, unavailable(environment.connectionId, this.deps.now()));
+            this.publish(this.deps.now());
+          }
+        });
+      }
+      const connection = environment.connection;
+      if (!connection || !this.active(environment) || !this.admitted().includes(environment)) return;
+      await this.enqueue(environment, false, async () => {
+        let candidate: ConnectionCandidate | undefined;
+        let health: "unavailable" | "incompatible" = "unavailable";
+        try {
+          candidate = await this.collectConnection(connection, environment.client);
+          if (!candidate) health = "incompatible";
+        } catch {
+          /* A failed connection contributes only its unavailable snapshot. */
+        }
+        if (
+          !this.active(environment) ||
+          environment.connection !== connection ||
+          !this.admitted().includes(environment)
+        )
+          return;
+        const now = this.deps.now();
+        // Project only at synchronous commit: acknowledgements made while I/O was pending remain authoritative.
+        const snapshot = candidate
+          ? this.state.project(
+              environment.connectionId,
+              candidate.rootSessions,
+              candidate.attentionRoots,
+              candidate.activeRoots,
+              now,
+              candidate.complete,
+            )
+          : { ...unavailable(environment.connectionId, now), health };
+        this.state.label([snapshot], now);
+        this.snapshots.set(environment.connectionId, snapshot);
+        if (!candidate && connection.tunnel) {
+          environment.connection = undefined;
+          this.publish(now);
+          await this.terminateChild(connection.tunnel);
+        } else this.publish(now);
+      });
+    })().finally(() => {
+      if (environment.pending === pending) environment.pending = undefined;
+    });
+    environment.pending = pending;
+    return pending;
   }
 
   private async discoverLocal(): Promise<Connection[]> {
@@ -213,7 +511,7 @@ export class OpenCodeCollector {
         const registration = parseRegistration(bytes);
         if (!registration) continue;
         const connectionId = this.opaqueId(`local\0${registration.id ?? name}`);
-        const existing = this.connections.get(connectionId);
+        const existing = this.local.get(connectionId)?.connection;
         if (
           existing &&
           !existing.tunnel &&
@@ -239,76 +537,18 @@ export class OpenCodeCollector {
     return [...new Map(connections.map((connection) => [connection.connectionId, connection])).values()];
   }
 
-  private async discoverSsh(): Promise<{ connections: Connection[]; failures: string[] }> {
-    let servers: SshServer[];
-    try {
-      const bytes = await this.deps.files.readSecure(
-        this.deps.settingsPath,
-        SETTINGS_LIMIT,
-        this.deps.currentUid,
-        "owner-write",
-      );
-      servers = parseSshServers(bytes);
-    } catch {
-      return { connections: [], failures: [] };
-    }
-    if (!this.orphansReaped) {
-      const templates = this.tunnelTemplates(servers);
-      if (templates.length > 0) {
-        try {
-          await this.deps.reapOrphanedTunnels(templates);
-          this.orphansReaped = true;
-        } catch {
-          // Retried on the next discovery.
-        }
-      }
-    }
-    const targets = new Map(
-      servers.map((server) => {
-        const id = this.opaqueId(`ssh\0${server.id}`);
-        try {
-          return [id, JSON.stringify(parseSshTarget(server.target))] as const;
-        } catch {
-          return [id, null] as const;
-        }
-      }),
-    );
-    for (const [id, connection] of this.tunnels) {
-      if (targets.get(id) === connection.sshTarget) continue;
-      this.tunnels.delete(id);
-      if (connection.tunnel) await this.terminateChild(connection.tunnel);
-    }
-    const results = await mapConcurrent(servers, 2, async (server) => {
-      const connectionId = this.opaqueId(`ssh\0${server.id}`);
-      const existing = this.tunnels.get(connectionId);
-      if (existing) return { connection: existing };
-      try {
-        const connection = await this.openSsh(server, connectionId);
-        if (!this.running) {
-          if (connection.tunnel) await this.terminateChild(connection.tunnel);
-          return { failure: connectionId };
-        }
-        connection.sshTarget = targets.get(connectionId) ?? undefined;
-        this.tunnels.set(connectionId, connection);
-        return { connection };
-      } catch {
-        return { failure: connectionId };
-      }
-    });
-    return {
-      connections: results.flatMap((result) => (result.connection ? [result.connection] : [])),
-      failures: results.flatMap((result) => (result.failure ? [result.failure] : [])),
-    };
-  }
-
-  private async openSsh(server: SshServer, connectionId: string): Promise<Connection> {
+  private async openSsh(server: SshServer, connectionId: string, environment: Environment): Promise<Connection> {
     const target = parseSshTarget(server.target);
     const common = sshCommonArgs(target.args);
     const discovery = await this.deps.spawn(SSH_EXECUTABLE, [...common, target.host, "sh -l -s"], {
       env: minimalSshEnvironment(this.deps.homeDirectory),
       detached: true,
     });
-    this.children.add(discovery);
+    this.children.set(discovery, environment);
+    if (!this.active(environment)) {
+      await this.terminateChild(discovery);
+      throw new Error("stopped");
+    }
     discovery.write(REMOTE_DISCOVERY_SCRIPT);
     discovery.end();
     let timeoutHandle: NodeJS.Timeout | undefined;
@@ -327,13 +567,14 @@ export class OpenCodeCollector {
         timeout,
       ]);
     } catch (error) {
-      await this.deps.terminateProcessGroup(discovery);
+      await this.terminateChild(discovery);
       throw error;
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       this.children.delete(discovery);
     }
     if (code !== 0) throw new Error("ssh-discovery");
+    if (!this.active(environment)) throw new Error("stopped");
     const registration = parseRemoteRegistration(output);
     if (!registration) throw new Error("ssh-registration");
     const remote = loopbackAddress(registration.url, true);
@@ -343,7 +584,11 @@ export class OpenCodeCollector {
       env: minimalSshEnvironment(this.deps.homeDirectory),
       detached: true,
     });
-    this.children.add(tunnel);
+    this.children.set(tunnel, environment);
+    if (!this.active(environment)) {
+      await this.terminateChild(tunnel);
+      throw new Error("stopped");
+    }
     try {
       if (!(await this.deps.waitForLoopbackPort(localPort, FETCH_TIMEOUT_MS))) throw new Error("ssh-forward");
       const endpoint = `http://127.0.0.1:${localPort}`;
@@ -355,7 +600,7 @@ export class OpenCodeCollector {
         pid: registration.pid,
         tunnel,
       };
-      if (!(await this.client.verifyIdentity(connection))) throw new Error("ssh-identity");
+      if (!(await environment.client.verifyIdentity(connection))) throw new Error("ssh-identity");
       return connection;
     } catch (error) {
       await this.terminateChild(tunnel);
@@ -363,19 +608,16 @@ export class OpenCodeCollector {
     }
   }
 
-  private async collectConnection(connection: Connection, now: number): Promise<OpenCodeConnectionSnapshot> {
-    if (!(await this.client.verifyIdentity(connection))) {
-      if (connection.tunnel) {
-        this.tunnels.delete(connection.connectionId);
-        await this.terminateChild(connection.tunnel);
-      }
-      return { ...unavailable(connection.connectionId, now), health: "incompatible" };
-    }
+  private async collectConnection(
+    connection: Connection,
+    client: AuthenticatedOpenCodeClient,
+  ): Promise<ConnectionCandidate | undefined> {
+    if (!(await client.verifyIdentity(connection))) return;
     const [activeRaw, permissionRaw, formRaw, rootsRaw] = await Promise.all([
-      this.client.fetchJson(connection, "/api/session/active"),
-      this.client.fetchJson(connection, "/api/permission/request"),
-      this.client.fetchJson(connection, "/api/form"),
-      this.client.fetchJson(connection, "/api/session?parentID=null&order=desc&limit=100"),
+      client.fetchJson(connection, "/api/session/active"),
+      client.fetchJson(connection, "/api/permission/request"),
+      client.fetchJson(connection, "/api/form"),
+      client.fetchJson(connection, "/api/session?parentID=null&order=desc&limit=100"),
     ]);
     const activeIds = parseActive(activeRaw);
     const attentionIds = [...parsePending(permissionRaw), ...parsePending(formRaw)];
@@ -402,7 +644,7 @@ export class OpenCodeCollector {
           }
           let request = sessionRequests.get(currentId);
           if (!request) {
-            request = this.client
+            request = client
               .fetchJson(connection, `/api/session/${encodeURIComponent(currentId)}`)
               .then(parseSessionEnvelope);
             sessionRequests.set(currentId, request);
@@ -433,7 +675,7 @@ export class OpenCodeCollector {
       if (session && session.parentID === undefined) activeRoots.add(id);
     }
     const rootSessions = [...sessions.values()].filter((session) => session.parentID === undefined);
-    return this.state.project(connection.connectionId, rootSessions, attentionRoots, activeRoots, now, complete);
+    return { rootSessions, attentionRoots, activeRoots, complete };
   }
 
   // Command lines a tunnel for each saved target would have; an earlier plugin process killed without
@@ -455,13 +697,26 @@ export class OpenCodeCollector {
   }
 
   private async terminateChild(child: OpenCodeProcess): Promise<void> {
-    if (!this.children.delete(child)) return;
-    await this.deps.terminateProcessGroup(child);
+    const owner = this.children.get(child);
+    if (!owner) return;
+    this.children.delete(child);
+    const terminated = this.deps.terminateProcessGroup(child);
+    this.terminating.set(terminated, owner.generation);
+    try {
+      await terminated;
+    } finally {
+      this.terminating.delete(terminated);
+    }
   }
 
-  private async terminateChildren(): Promise<void> {
-    const children = [...this.children];
-    this.children.clear();
-    await Promise.allSettled(children.map((child) => this.deps.terminateProcessGroup(child)));
+  private async terminateChildren(generation: number): Promise<void> {
+    const children = [...this.children.entries()]
+      .filter(([, owner]) => owner.generation === generation)
+      .map(([child]) => child);
+    const started = children.map((child) => this.terminateChild(child));
+    const pending = [...this.terminating.entries()]
+      .filter(([, owner]) => owner === generation)
+      .map(([promise]) => promise);
+    await Promise.allSettled([...started, ...pending]);
   }
 }
