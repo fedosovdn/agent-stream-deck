@@ -316,17 +316,24 @@ export async function applyRuntimeOverride(port: number, timeout = 20_000): Prom
   try {
     await client.connect();
     let result: unknown;
+    let slotError: unknown;
     while (Date.now() < deadline) {
       result = await client.evaluate(buildRuntimeOverrideExpression());
       if ((result as { ready?: boolean } | null)?.ready) {
-        const snapshot = (await client.evaluate(buildMicroSnapshotExpression())) as { slots?: unknown[] };
-        if (!Array.isArray(snapshot?.slots) || snapshot.slots.length !== 6)
-          throw new Error("Codex Micro slot verification failed.");
-        return { ...(result as object), slotsReady: true, slotCount: snapshot.slots.length };
+        try {
+          const snapshot = (await client.evaluate(buildMicroSnapshotExpression())) as { slots?: unknown[] };
+          if (!Array.isArray(snapshot?.slots) || snapshot.slots.length !== 6)
+            throw new Error("Codex Micro slot verification failed.");
+          return { ...(result as object), slotsReady: true, slotCount: snapshot.slots.length };
+        } catch (error) {
+          slotError = error;
+        }
       }
-      await delay(Math.min(100, remaining(deadline)));
+      if (Date.now() < deadline) await delay(Math.min(100, remaining(deadline)));
     }
-    throw new Error(`Timed out enabling the Codex Micro runtime: ${JSON.stringify(result)}`);
+    throw new Error(
+      `Timed out enabling the Codex Micro runtime: ${JSON.stringify(result)}${slotError ? `; ${String(slotError)}` : ""}`,
+    );
   } finally {
     client.close();
   }

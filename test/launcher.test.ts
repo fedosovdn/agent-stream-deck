@@ -1,5 +1,8 @@
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import { WebSocketServer } from "ws";
 import { execFile } from "node:child_process";
 import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +11,12 @@ import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { buildRuntimeOverrideExpression, buildRuntimeVerificationExpression, selectRuntimeTarget } from "#codex";
+import {
+  applyRuntimeOverride,
+  buildRuntimeOverrideExpression,
+  buildRuntimeVerificationExpression,
+  selectRuntimeTarget,
+} from "#codex";
 
 const execFileAsync = promisify(execFile);
 
@@ -257,3 +265,57 @@ test("Windows updater preserves unproven SSH and cleans only retired same-root b
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /fixture passed/);
 });
+
+for (const scenario of ["temporary-error", "incomplete-slots", "deadline"] as const) {
+  test(`launcher waits for slot readiness: ${scenario}`, async (context) => {
+    context.mock.timers.enable({ apis: ["Date"], now: 1_000 });
+    let port = 0;
+    let snapshots = 0;
+    const server = createServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify([{ type: "page", url: "app://-/index.html", webSocketDebuggerUrl: `ws://127.0.0.1:${port}` }]),
+      );
+    });
+    const sockets = new WebSocketServer({ server });
+    sockets.on("connection", (socket) =>
+      socket.on("message", (raw) => {
+        const request = JSON.parse(String(raw));
+        if (request.params.expression === buildRuntimeOverrideExpression()) {
+          socket.send(JSON.stringify({ id: request.id, result: { result: { value: { ready: true } } } }));
+          return;
+        }
+        snapshots++;
+        if (scenario === "deadline") context.mock.timers.tick(2_000);
+        if ((scenario === "temporary-error" && snapshots === 1) || scenario === "deadline") {
+          socket.send(
+            JSON.stringify({
+              id: request.id,
+              result: {
+                exceptionDetails: { text: "Codex Micro slot store was not found." },
+              },
+            }),
+          );
+          return;
+        }
+        const slots = scenario === "incomplete-slots" && snapshots === 1 ? [] : [{}, {}, {}, {}, {}, {}];
+        socket.send(JSON.stringify({ id: request.id, result: { result: { value: { slots } } } }));
+      }),
+    );
+    context.after(async () => {
+      for (const socket of sockets.clients) socket.terminate();
+      await new Promise<void>((resolve) => sockets.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    port = (server.address() as { port: number }).port;
+    if (scenario === "deadline") {
+      await assert.rejects(applyRuntimeOverride(port, 2_000), /Timed out.*slot store was not found/s);
+      assert.equal(snapshots, 1);
+    } else {
+      assert.deepEqual(await applyRuntimeOverride(port, 2_000), { ready: true, slotsReady: true, slotCount: 6 });
+      assert.equal(snapshots, 2);
+    }
+  });
+}
