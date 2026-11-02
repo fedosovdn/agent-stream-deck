@@ -1,3 +1,4 @@
+import { buildModuleDiscoveryExpression } from "./module-discovery.js";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -106,11 +107,12 @@ const REASONING_ENCODER_KEYS: Record<ReasoningAdjustment, "ENC_CW" | "ENC_CC"> =
   increase: "ENC_CC",
 };
 
+export function buildMicroSnapshotExpression(): string {
+  return SNAPSHOT_EXPRESSION;
+}
+
 const SNAPSHOT_EXPRESSION = `(async () => {
-  const urls = [...new Set([
-    ...[...document.querySelectorAll('link[href], script[src]')].map((element) => element.href || element.src),
-    ...performance.getEntriesByType('resource').map((entry) => entry.name)
-  ])].filter((url) => url.includes('/assets/') && url.endsWith('.js'));
+  const urls = await ${buildModuleDiscoveryExpression()};
   const slotSignalsUrl = urls.find((url) => url.includes('/assets/codex-micro-slot-signals-'));
   if (!slotSignalsUrl) throw new Error('Codex Micro slot signals are not loaded.');
 
@@ -585,10 +587,7 @@ export class CodexMicroRendererBridge {
     await this.ensureConnected();
     this.checkGeneration(generation);
     const expression = `(async () => {
-      const urls = [...new Set([
-        ...[...document.querySelectorAll('link[href], script[src]')].map((element) => element.href || element.src),
-        ...performance.getEntriesByType('resource').map((entry) => entry.name)
-      ])];
+      const urls = await ${buildModuleDiscoveryExpression(false)};
       const moduleUrl = (prefix) => urls.find((value) => value.includes('/assets/' + prefix));
       const layoutUrl = moduleUrl('codex-micro-layout-');
       const commandsUrl = moduleUrl('run-command-');
@@ -679,10 +678,7 @@ export class CodexMicroRendererBridge {
     this.checkGeneration(generation);
     const message = { type, ...payload };
     const expression = `(async () => {
-      const urls = [...new Set([
-        ...[...document.querySelectorAll('link[href], script[src]')].map((element) => element.href || element.src),
-        ...performance.getEntriesByType('resource').map((entry) => entry.name)
-      ])].filter((url) => url.includes('/assets/') && url.endsWith('.js'));
+      const urls = await ${buildModuleDiscoveryExpression(false)};
       let bus = null;
       for (const url of urls) {
         try {

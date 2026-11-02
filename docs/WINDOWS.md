@@ -67,3 +67,7 @@ Uninstalling the watcher does not close or restart Codex.
 Automatic recovery reserves a global ten-minute cooldown before each restart; process replacement and failed attempts do not reset it. Updating waits up to 30 seconds for the owned watcher mutex; timeout retains the stop marker and leaves bundle files untouched. The runtime and its packaged dependencies are safely imported from a staged autonomous copy before stopping. Readiness confirms the new live process and startup token.
 
 An old `relay-tunnel.pid` is used only with its saved `relay-client.json` and exact documented SSH command to prove ownership. Proven old Codex relay tunnels are stopped; unknown SSH or OpenCode processes remain untouched and the update reports an incomplete migration. Private JSON settings remain on disk. Only the retired `Configure-CodexDeckRelay.ps1`, `Configure-CodexDeckMobile.ps1`, and `mobile-pairing.mjs` bundle files are removed.
+
+## Renderer module discovery
+
+Some Codex builds omit dynamically imported Micro chunks from resource timing and preload links. The bridge falls back to a bounded, same-host dependency walk of core renderer modules, caches successful discovery for the document lifetime, and retries failed discovery. Launcher readiness now requires a successful six-slot snapshot, not only device activation. No installed Codex files are changed.
